@@ -144,14 +144,14 @@ final class LayoutStore: ObservableObject {
 
     // MARK: - 拖拽移动
 
-    /// 把应用移动到指定 (页, 槽位)。slot 为"移除被拖应用后"目标页内可见条目的插入位置。
-    /// toPage 超出现有页数时自动创建承接新页。
-    func moveApp(_ appID: String, toPage: Int, slot: Int) {
-        guard let (newApps, newGroups) = Self.applyMove(apps: layout.apps,
-                                                        groups: layout.groups,
-                                                        appID: appID,
-                                                        toPage: toPage,
-                                                        slot: slot) else { return }
+    /// 把条目(应用或文件夹图块)移动到指定 (页, 槽位)。
+    /// slot 为"移除被拖条目后"目标页内可见条目的插入位置;toPage 越界时自动创建承接新页。
+    func moveEntry(_ entryID: String, toPage: Int, slot: Int) {
+        guard let (newApps, newGroups) = Self.applyMoveEntity(apps: layout.apps,
+                                                              groups: layout.groups,
+                                                              entityID: entryID,
+                                                              toPage: toPage,
+                                                              slot: slot) else { return }
         layout.apps = newApps
         layout.groups = newGroups
         commitMutation()
@@ -413,13 +413,24 @@ final class LayoutStore: ObservableObject {
         }
     }
 
-    /// 纯函数:把应用移到 (页, 可见槽位)。slot 按"可见条目"计数(隐藏应用保持相对位置)。
+    /// 纯函数:把应用移到 (页, 可见槽位)。保留旧名以兼容既有测试。
     static func applyMove(apps: [AppRecord], groups: [GroupRecord],
                           appID: String, toPage: Int, slot: Int)
         -> (apps: [AppRecord], groups: [GroupRecord])? {
+        applyMoveEntity(apps: apps, groups: groups, entityID: appID, toPage: toPage, slot: slot)
+    }
+
+    /// 纯函数:把实体(应用或文件夹图块)移到 (页, 可见槽位)。
+    /// slot 按"可见条目"计数(隐藏应用保持相对位置);文件夹不可放入文件夹。
+    static func applyMoveEntity(apps: [AppRecord], groups: [GroupRecord],
+                                entityID: String, toPage: Int, slot: Int)
+        -> (apps: [AppRecord], groups: [GroupRecord])? {
         var apps = apps
         var groups = groups
-        guard let recordIndex = apps.firstIndex(where: { $0.id == appID }) else { return nil }
+
+        let isFolder = groups.contains { $0.id == entityID && $0.isFolder }
+        let appIndex = apps.firstIndex { $0.id == entityID }
+        guard isFolder || appIndex != nil else { return nil }
 
         var pageGroups = groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
         guard !pageGroups.isEmpty, toPage >= 0 else { return nil }
@@ -434,13 +445,21 @@ final class LayoutStore: ObservableObject {
         }
 
         let target = pageGroups[toPage]
-        let sourceGroupID = apps[recordIndex].groupID
-        let sourcePage = pageGroups.first { $0.id == sourceGroupID }
 
-        // 目标页实体(不含被拖应用),可见槽位 → 全列表插入点
+        // 源信息(用于事后压实)
+        var sourceGroupID: String?          // 应用的来源组(页或文件夹)
+        var sourceHostPage: GroupRecord?    // 文件夹的原宿主页
+        if isFolder {
+            let folderPage = groups.first { $0.id == entityID }!.page
+            sourceHostPage = pageGroups.first { $0.page == folderPage }
+        } else {
+            sourceGroupID = apps[appIndex!].groupID
+        }
+
+        // 目标页实体(不含被拖实体),可见槽位 → 全列表插入点
         var targetEntities = entityList(apps: apps, groups: groups,
                                         pageID: target.id, page: target.page)
-            .filter { $0.id != appID }
+            .filter { $0.id != entityID }
         let visiblePositions = targetEntities.enumerated()
             .filter { !$0.element.hidden }
             .map(\.offset)
@@ -449,28 +468,41 @@ final class LayoutStore: ObservableObject {
             ? visiblePositions[visibleSlot]
             : targetEntities.count
 
-        let dragged = LayoutEntity(ref: .app(appID), order: 0, hidden: apps[recordIndex].hidden)
-        targetEntities.insert(dragged, at: insertAt)
+        let moved = LayoutEntity(ref: isFolder ? .folder(entityID) : .app(entityID),
+                                 order: 0,
+                                 hidden: isFolder ? false : apps[appIndex!].hidden)
+        targetEntities.insert(moved, at: insertAt)
         renumber(targetEntities, pageID: target.id, page: target.page,
                  apps: &apps, groups: &groups)
 
-        // 源页压实(跨页移动时;若源是文件夹则压实文件夹内序)
-        if sourceGroupID != target.id {
-            if let sp = sourcePage {
+        // 源侧压实(renumber 已把实体移走,重新取列表自然不含它)
+        if isFolder {
+            if let sp = sourceHostPage, sp.id != target.id {
+                let remaining = entityList(apps: apps, groups: groups,
+                                           pageID: sp.id, page: sp.page)
+                renumber(remaining, pageID: sp.id, page: sp.page, apps: &apps, groups: &groups)
+            }
+        } else if let sourceGroupID, sourceGroupID != target.id {
+            if let sp = pageGroups.first(where: { $0.id == sourceGroupID }) {
                 let remaining = entityList(apps: apps, groups: groups,
                                            pageID: sp.id, page: sp.page)
                 renumber(remaining, pageID: sp.id, page: sp.page, apps: &apps, groups: &groups)
             } else {
-                // 源是文件夹:成员 order 压实
-                let members = apps.indices
-                    .filter { apps[$0].groupID == sourceGroupID }
-                    .sorted { apps[$0].order < apps[$1].order }
-                for (order, idx) in members.enumerated() {
-                    apps[idx].order = order
-                }
+                // 源是文件夹:成员 order 压实(拖出文件夹的路径)
+                compactFolderMembers(&apps, folderID: sourceGroupID)
             }
         }
         return (apps, groups)
+    }
+
+    /// 文件夹成员 order 压实为 0..n。
+    private static func compactFolderMembers(_ apps: inout [AppRecord], folderID: String) {
+        let members = apps.indices
+            .filter { apps[$0].groupID == folderID }
+            .sorted { apps[$0].order < apps[$1].order }
+        for (order, idx) in members.enumerated() {
+            apps[idx].order = order
+        }
     }
 
     /// 纯函数:创建文件夹。文件夹占据 target 在页内的槽位,target 在前 source 在后。
@@ -502,11 +534,15 @@ final class LayoutStore: ObservableObject {
                                       pageID: hostPage.id, page: hostPage.page)
         renumber(hostEntities, pageID: hostPage.id, page: hostPage.page,
                  apps: &apps, groups: &groups)
-        if sourceGroupID != hostPage.id,
-           let sp = groups.first(where: { $0.id == sourceGroupID && !$0.isFolder }) {
-            let sourceEntities = entityList(apps: apps, groups: groups,
-                                            pageID: sp.id, page: sp.page)
-            renumber(sourceEntities, pageID: sp.id, page: sp.page, apps: &apps, groups: &groups)
+        if sourceGroupID != hostPage.id {
+            if let sp = groups.first(where: { $0.id == sourceGroupID && !$0.isFolder }) {
+                let sourceEntities = entityList(apps: apps, groups: groups,
+                                                pageID: sp.id, page: sp.page)
+                renumber(sourceEntities, pageID: sp.id, page: sp.page,
+                         apps: &apps, groups: &groups)
+            } else {
+                compactFolderMembers(&apps, folderID: sourceGroupID)  // 从别的文件夹拖出
+            }
         }
         return (apps, groups, folderID)
     }
@@ -530,6 +566,8 @@ final class LayoutStore: ObservableObject {
             let sourceEntities = entityList(apps: apps, groups: groups,
                                             pageID: sp.id, page: sp.page)
             renumber(sourceEntities, pageID: sp.id, page: sp.page, apps: &apps, groups: &groups)
+        } else {
+            compactFolderMembers(&apps, folderID: sourceGroupID)  // 夹到夹的移动
         }
         return (apps, groups)
     }
