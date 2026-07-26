@@ -20,6 +20,8 @@ final class AppState: ObservableObject {
     @Published var openFolderID: String?
     /// 是否正在编辑文件夹标题(改名中):此时按键全部放行给输入框。
     var folderTitleEditing = false
+    /// 设置面板是否打开(⌘, / 菜单入口)。
+    @Published var showSettings = false
 
     func flipPage(_ delta: Int) {
         var count = LayoutStore.shared.pages.count
@@ -50,6 +52,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyRef: EventHotKeyRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 把持久化设置注入布局层(布局层不直接依赖设置层,便于独立测试)
+        LayoutStore.columns = Settings.columns
+        LayoutStore.rows = Settings.rows
         setUpWindow()
         setUpStatusItem()
         registerHotKey()
@@ -100,6 +105,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.hide(nil)
     }
 
+    /// 菜单栏入口:唤起并打开设置面板。
+    @objc private func openSettings() {
+        showOverlay()
+        AppState.shared.showSettings = true
+    }
+
     /// 松开鼠标 = 一次按住结束,解除"拖拽已取消"的抑制。
     private func setUpMouseUpMonitor() {
         NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { event in
@@ -142,6 +153,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     action: #selector(toggleOverlay), keyEquivalent: "")
             toggle.target = self
             menu.addItem(toggle)
+            let settings = NSMenuItem(title: "设置…",
+                                      action: #selector(openSettings), keyEquivalent: ",")
+            settings.target = self
+            menu.addItem(settings)
             menu.addItem(.separator())
             let quit = NSMenuItem(title: "退出",
                                   action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -154,21 +169,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - 全局快捷键 ⌥空格(Carbon API,无需辅助功能权限)
+    // MARK: - 全局快捷键(Carbon API,无需辅助功能权限;组合键可在设置中切换)
+
+    private var hotKeyHandlerInstalled = false
 
     private func registerHotKey() {
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
-                                      eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            DispatchQueue.main.async {
-                (NSApp.delegate as? AppDelegate)?.toggleOverlay()
-            }
-            return noErr
-        }, 1, &eventType, nil, nil)
-
+        if !hotKeyHandlerInstalled {
+            var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                          eventKind: UInt32(kEventHotKeyPressed))
+            InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+                DispatchQueue.main.async {
+                    (NSApp.delegate as? AppDelegate)?.toggleOverlay()
+                }
+                return noErr
+            }, 1, &eventType, nil, nil)
+            hotKeyHandlerInstalled = true
+        }
+        if let existing = hotKeyRef {
+            UnregisterEventHotKey(existing)
+            hotKeyRef = nil
+        }
+        let option = Settings.hotkeyOption
         let hotKeyID = EventHotKeyID(signature: OSType(0x4C50_434C), id: 1) // "LPCL"
-        RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey),
+        RegisterEventHotKey(option.keyCode, option.modifiers,
                             hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    /// 设置面板切换了快捷键组合:重新注册。
+    func hotkeyChanged() {
+        registerHotKey()
     }
 
     // MARK: - 键盘
@@ -201,6 +230,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 拖拽中吞掉导航键:防止拖拽时回车开夹/启动应用造成状态交叠
             if AppState.shared.isDragging,
                [36, 76, 123, 124, 125, 126].contains(Int(event.keyCode)) {
+                return nil
+            }
+            // ⌘, 打开设置(通用快捷键)
+            if event.keyCode == 43, event.modifierFlags.contains(.command) {
+                AppState.shared.showSettings = true
                 return nil
             }
             // 文件夹展开时的键盘策略(先于 ⌘翻页,保证面板下网格不动):
