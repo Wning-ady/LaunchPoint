@@ -13,19 +13,16 @@ struct ContentView: View {
         Array(repeating: GridItem(.flexible(), spacing: 16), count: LayoutStore.columns)
     }
 
-    /// 搜索结果:显示名(别名优先)与默认名双路匹配。
+    /// 搜索结果:前缀/词首/首字母/缩写/拼音多路匹配,按匹配度排序。
     private var filtered: [AppItem] {
-        store.items.filter {
-            $0.displayName.localizedCaseInsensitiveContains(state.query)
-                || $0.name.localizedCaseInsensitiveContains(state.query)
-        }
+        SearchEngine.rank(state.effectiveQuery, in: store.items)
     }
 
     var body: some View {
         VStack(spacing: 16) {
             searchField
 
-            if state.query.isEmpty {
+            if state.effectiveQuery.isEmpty {
                 pagedGrid
                 pageDots
             } else {
@@ -39,6 +36,10 @@ struct ContentView: View {
         .onAppear {
             store.refresh()
             focusSearch()
+            // 预热搜索键(含 ICU 转换器首次初始化的约 40ms),挪出打字路径
+            DispatchQueue.main.async {
+                SearchEngine.prewarm(store.items)
+            }
         }
         // 每次从菜单栏/快捷键重新唤起时:重新对账(捕捉新装/卸载)并聚焦搜索框
         .onReceive(NotificationCenter.default.publisher(for: .refocusSearch)) { _ in
@@ -64,8 +65,8 @@ struct ContentView: View {
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
             .padding(.top, 52)
             .onSubmit {
-                // 搜索后按回车直接打开第一个结果
-                if !state.query.isEmpty, let first = filtered.first {
+                // 搜索后按回车直接打开第一个结果(纯空白查询不触发)
+                if !state.effectiveQuery.isEmpty, let first = filtered.first {
                     launch(first)
                 }
             }
@@ -160,14 +161,29 @@ struct ContentView: View {
     // MARK: - 搜索结果(扁平网格)
 
     private var searchResults: some View {
-        ScrollView {
-            LazyVGrid(columns: searchColumns, spacing: 30) {
-                ForEach(filtered) { app in
-                    appCell(app)
+        Group {
+            if filtered.isEmpty {
+                // 无结果时给出明确反馈,避免整片空白看起来像应用全部消失
+                VStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 34))
+                        .foregroundStyle(.secondary)
+                    Text("未找到“\(state.effectiveQuery)”")
+                        .font(.system(size: 15))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: searchColumns, spacing: 30) {
+                        ForEach(filtered) { app in
+                            appCell(app)
+                        }
+                    }
+                    .padding(.horizontal, 60)
+                    .padding(.bottom, 60)
                 }
             }
-            .padding(.horizontal, 60)
-            .padding(.bottom, 60)
         }
     }
 
