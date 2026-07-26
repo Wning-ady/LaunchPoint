@@ -128,10 +128,7 @@ final class LayoutStore: ObservableObject {
                                                         slot: slot) else { return }
         layout.apps = newApps
         layout.groups = newGroups
-        normalizeCapacity()
-        pruneTrailingEmptyPageGroups()
-        rebuildPages()
-        save()
+        commitMutation()
     }
 
     /// 删除持久层中"尾部"的空页组(中间空页保留,尊重用户留白)。
@@ -143,6 +140,179 @@ final class LayoutStore: ObservableObject {
                   !layout.apps.contains(where: { $0.groupID == last.id }) else { break }
             layout.groups.removeAll { $0.id == last.id }
             pageGroups.removeLast()
+        }
+    }
+
+    // MARK: - 文件夹操作
+
+    /// 把 source 应用拖到 target 应用上 → 创建文件夹容纳两者。
+    /// 文件夹占据 target 原来的槽位;返回新文件夹 id,失败返回 nil。
+    @discardableResult
+    func createFolder(dragging sourceID: String, onto targetID: String, name: String) -> String? {
+        guard let (apps, groups, folderID) = Self.applyCreateFolder(
+            apps: layout.apps, groups: layout.groups,
+            sourceID: sourceID, targetID: targetID, name: name) else { return nil }
+        layout.apps = apps
+        layout.groups = groups
+        commitMutation()
+        return folderID
+    }
+
+    /// 把应用放入已有文件夹(拖到文件夹上,或右键"移动到")。
+    func addToFolder(_ appID: String, folderID: String) {
+        guard let (apps, groups) = Self.applyAddToFolder(
+            apps: layout.apps, groups: layout.groups,
+            appID: appID, folderID: folderID) else { return }
+        layout.apps = apps
+        layout.groups = groups
+        commitMutation()
+    }
+
+    /// 重命名文件夹。
+    func renameFolder(_ folderID: String, to name: String) {
+        guard let idx = layout.groups.firstIndex(where: { $0.id == folderID && $0.isFolder })
+        else { return }
+        layout.groups[idx].name = name
+        commitMutation()
+    }
+
+    /// 解散文件夹:成员回到文件夹所在页、原槽位附近。
+    func dissolveFolder(_ folderID: String) {
+        guard let (apps, groups) = Self.applyDissolveFolder(
+            apps: layout.apps, groups: layout.groups, folderID: folderID) else { return }
+        layout.apps = apps
+        layout.groups = groups
+        commitMutation()
+    }
+
+    /// 文件夹内容(按 order,含隐藏过滤)。非文件夹 id 返回空。
+    func folderItems(_ folderID: String) -> [AppItem] {
+        guard layout.groups.contains(where: { $0.id == folderID && $0.isFolder }) else { return [] }
+        return layout.apps
+            .filter { $0.groupID == folderID && !$0.hidden }
+            .sorted { $0.order < $1.order }
+            .compactMap { record -> AppItem? in
+                guard var item = scannedByPath[record.id] else { return nil }
+                item.alias = record.alias
+                return item
+            }
+    }
+
+    /// 归一 + 修剪 + 自动解散单应用文件夹 + 重建 + 落盘(所有变更操作的统一收尾)。
+    private func commitMutation() {
+        autoDissolveSingletonFolders()
+        normalizeCapacity()
+        pruneTrailingEmptyPageGroups()
+        rebuildPages()
+        save()
+    }
+
+    /// 文件夹仅剩一个(或零个)应用时自动解散(还原原生行为)。
+    private func autoDissolveSingletonFolders() {
+        for folder in layout.groups where folder.isFolder {
+            let memberCount = layout.apps.filter { $0.groupID == folder.id }.count
+            if memberCount <= 1,
+               let (apps, groups) = Self.applyDissolveFolder(apps: layout.apps,
+                                                             groups: layout.groups,
+                                                             folderID: folder.id) {
+                layout.apps = apps
+                layout.groups = groups
+            }
+        }
+    }
+
+    /// 纯函数:创建文件夹。文件夹作为组占据 target 在页内的槽位(order 继承 target)。
+    static func applyCreateFolder(apps: [AppRecord], groups: [GroupRecord],
+                                  sourceID: String, targetID: String, name: String)
+        -> (apps: [AppRecord], groups: [GroupRecord], folderID: String)? {
+        var apps = apps
+        var groups = groups
+        guard sourceID != targetID,
+              let sourceIdx = apps.firstIndex(where: { $0.id == sourceID }),
+              let targetIdx = apps.firstIndex(where: { $0.id == targetID }) else { return nil }
+        // target 必须在页面上(不能在别的文件夹里再嵌套建夹)
+        guard let hostPage = groups.first(where: { $0.id == apps[targetIdx].groupID && !$0.isFolder })
+        else { return nil }
+
+        let folderID = "folder-" + UUID().uuidString
+        let folder = GroupRecord(id: folderID, isFolder: true, name: name,
+                                 page: hostPage.page, order: apps[targetIdx].order)
+        groups.append(folder)
+
+        let sourceGroupID = apps[sourceIdx].groupID
+        apps[targetIdx].groupID = folderID
+        apps[targetIdx].order = 0
+        apps[sourceIdx].groupID = folderID
+        apps[sourceIdx].order = 1
+
+        compactOrders(&apps, groupID: hostPage.id)
+        if sourceGroupID != hostPage.id {
+            compactOrders(&apps, groupID: sourceGroupID)
+        }
+        return (apps, groups, folderID)
+    }
+
+    /// 纯函数:应用入夹(追加到文件夹末尾)。
+    static func applyAddToFolder(apps: [AppRecord], groups: [GroupRecord],
+                                 appID: String, folderID: String)
+        -> (apps: [AppRecord], groups: [GroupRecord])? {
+        var apps = apps
+        guard groups.contains(where: { $0.id == folderID && $0.isFolder }),
+              let idx = apps.firstIndex(where: { $0.id == appID }),
+              apps[idx].groupID != folderID else { return nil }
+
+        let sourceGroupID = apps[idx].groupID
+        let nextOrder = (apps.filter { $0.groupID == folderID }.map(\.order).max() ?? -1) + 1
+        apps[idx].groupID = folderID
+        apps[idx].order = nextOrder
+        compactOrders(&apps, groupID: sourceGroupID)
+        return (apps, groups)
+    }
+
+    /// 纯函数:解散文件夹,成员插回文件夹所在页的原槽位处(保持相对顺序)。
+    static func applyDissolveFolder(apps: [AppRecord], groups: [GroupRecord],
+                                    folderID: String)
+        -> (apps: [AppRecord], groups: [GroupRecord])? {
+        var apps = apps
+        var groups = groups
+        guard let folder = groups.first(where: { $0.id == folderID && $0.isFolder }),
+              let hostPage = groups.first(where: { !$0.isFolder && $0.page == folder.page })
+        else { return nil }
+
+        let members = apps.indices
+            .filter { apps[$0].groupID == folderID }
+            .sorted { apps[$0].order < apps[$1].order }
+
+        // 宿主页成员按 order 排队,文件夹槽位处依次插入成员
+        let pageMembers = apps.indices
+            .filter { apps[$0].groupID == hostPage.id }
+            .sorted { apps[$0].order < apps[$1].order }
+        var finalOrder: [Int] = []
+        var inserted = false
+        for idx in pageMembers {
+            if !inserted && apps[idx].order >= folder.order {
+                finalOrder.append(contentsOf: members)
+                inserted = true
+            }
+            finalOrder.append(idx)
+        }
+        if !inserted { finalOrder.append(contentsOf: members) }
+
+        for (order, idx) in finalOrder.enumerated() {
+            apps[idx].groupID = hostPage.id
+            apps[idx].order = order
+        }
+        groups.removeAll { $0.id == folderID }
+        return (apps, groups)
+    }
+
+    /// 组内 order 压实为 0..n。
+    private static func compactOrders(_ apps: inout [AppRecord], groupID: String) {
+        let indices = apps.indices
+            .filter { apps[$0].groupID == groupID }
+            .sorted { apps[$0].order < apps[$1].order }
+        for (order, idx) in indices.enumerated() {
+            apps[idx].order = order
         }
     }
 
@@ -222,7 +392,17 @@ final class LayoutStore: ObservableObject {
         while pages.count > 1, pages.last?.isEmpty == true {
             pages.removeLast()
         }
-        items = pages.flatMap { $0 }
+        // items 含文件夹内的应用:搜索必须能找到收纳起来的应用
+        let folderIDs = Set(layout.groups.filter(\.isFolder).map(\.id))
+        let folderMembers = layout.apps
+            .filter { folderIDs.contains($0.groupID) && !$0.hidden }
+            .sorted { $0.order < $1.order }
+            .compactMap { record -> AppItem? in
+                guard var item = scannedByPath[record.id] else { return nil }
+                item.alias = record.alias
+                return item
+            }
+        items = pages.flatMap { $0 } + folderMembers
     }
 
     /// 每页最多 capacity 个;超出的按序搬到下一页开头,必要时自动建新页。
