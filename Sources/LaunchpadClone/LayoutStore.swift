@@ -44,6 +44,18 @@ struct Layout: Codable {
     }
 }
 
+enum LayoutBackupError: LocalizedError {
+    case unsupportedVersion(Int)
+    case missingPage
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedVersion(let version): return "不支持的布局备份版本（\(version)）。"
+        case .missingPage: return "布局备份缺少页面数据。"
+        }
+    }
+}
+
 // MARK: - 展示模型
 
 /// 文件夹图块信息。
@@ -93,6 +105,12 @@ final class LayoutStore: ObservableObject {
 
     /// 上次扫描结果(路径 → AppItem),供不重扫磁盘的快速重建(如拖拽移动)使用。
     private var scannedByPath: [String: AppItem] = [:]
+    private var refreshGeneration = 0
+    private var refreshInFlight = false
+    private var refreshSources: [String] = []
+    private var pendingRefresh: (generation: Int, sources: [String])?
+    private let scanQueue = DispatchQueue(label: "LaunchpadClone.application-scan",
+                                          qos: .userInitiated)
 
     private static let fileURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory,
@@ -113,8 +131,51 @@ final class LayoutStore: ObservableObject {
 
     /// 扫描磁盘并与已存布局对账,然后刷新展示列表并落盘。
     func refresh() {
+        refreshGeneration &+= 1
         let sources = layout.sources.filter(\.enabled).map(\.path)
         let scanned = AppScanner.scan(sources: sources)
+        reconcile(scanned)
+    }
+
+    /// 后台扫描应用目录，避免启动台首次出现时阻塞主线程。
+    func refreshAsync() {
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        let sources = layout.sources.filter(\.enabled).map(\.path)
+
+        // 多个唤起通知可能在数百毫秒内连续到达。同一来源扫描正在进行时
+        // 直接复用它，来源变更则只保留最后一次请求，避免并发解码全部应用图标。
+        if refreshInFlight {
+            if sources != refreshSources {
+                pendingRefresh = (generation, sources)
+            }
+            return
+        }
+        startAsyncRefresh(generation: generation, sources: sources)
+    }
+
+    private func startAsyncRefresh(generation: Int, sources: [String]) {
+        refreshInFlight = true
+        refreshSources = sources
+        scanQueue.async { [weak self] in
+            let scanned = AppScanner.scan(sources: sources)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.refreshGeneration == generation {
+                    self.reconcile(scanned)
+                }
+                self.refreshInFlight = false
+                self.refreshSources = []
+                if let pending = self.pendingRefresh {
+                    self.pendingRefresh = nil
+                    self.startAsyncRefresh(generation: pending.generation,
+                                           sources: pending.sources)
+                }
+            }
+        }
+    }
+
+    private func reconcile(_ scanned: [AppItem]) {
         let byPath = Dictionary(uniqueKeysWithValues: scanned.map { ($0.id, $0) })
         scannedByPath = byPath
 
@@ -276,6 +337,48 @@ final class LayoutStore: ObservableObject {
         commitMutation()
     }
 
+    /// 当前应用来源，按设置中的顺序返回。
+    func sourceRecords() -> [SourceRecord] {
+        layout.sources
+    }
+
+    /// 启用或停用一个应用来源，并立即重新扫描。
+    func setSourceEnabled(_ path: String, enabled: Bool) {
+        guard let index = layout.sources.firstIndex(where: { $0.path == path }) else { return }
+        layout.sources[index].enabled = enabled
+        save()
+        refreshAsync()
+    }
+
+    /// 添加自定义应用来源。重复路径不会重复写入。
+    func addSource(path: String) {
+        guard !path.isEmpty, !layout.sources.contains(where: { $0.path == path }) else { return }
+        layout.sources.append(SourceRecord(path: path, enabled: true))
+        save()
+        refreshAsync()
+    }
+
+    /// 删除自定义应用来源。默认来源也允许移除，便于用户精简扫描范围。
+    func removeSource(path: String) {
+        layout.sources.removeAll { $0.path == path }
+        save()
+        refreshAsync()
+    }
+
+    /// 保持当前顺序，把所有页面级条目压实到连续槽位，消除页面之间的空洞。
+    func fillEmptySlots() {
+        let pageGroups = layout.groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
+        guard let firstPage = pageGroups.first else { return }
+        let entities = pageGroups.flatMap {
+            Self.entityList(apps: layout.apps, groups: layout.groups,
+                            pageID: $0.id, page: $0.page)
+        }
+        for (order, entity) in entities.enumerated() {
+            assign(entity, pageID: firstPage.id, page: firstPage.page, order: order)
+        }
+        commitMutation()
+    }
+
     /// 按显示名重排所有页面级条目(应用+文件夹图块),从第一页起连续排列,
     /// 超容由容量归一自动分页。文件夹内部顺序不动。
     func arrangeAllByName() {
@@ -306,6 +409,27 @@ final class LayoutStore: ObservableObject {
             assign(entity, pageID: firstPage.id, page: firstPage.page, order: order)
         }
         commitMutation()
+    }
+
+    /// 导出完整布局。应用本体不包含在备份中，恢复时会按当前机器重新扫描对账。
+    func backupData() throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try encoder.encode(layout)
+    }
+
+    /// 恢复布局并立即与当前机器的应用目录对账。
+    func restoreBackup(_ data: Data) throws {
+        let restored = try JSONDecoder().decode(Layout.self, from: data)
+        guard restored.version == Layout.initial().version else {
+            throw LayoutBackupError.unsupportedVersion(restored.version)
+        }
+        guard restored.groups.contains(where: { !$0.isFolder }) else {
+            throw LayoutBackupError.missingPage
+        }
+        layout = restored
+        save()
+        refreshAsync()
     }
 
     // MARK: - 变更收尾
