@@ -8,7 +8,7 @@ struct ContentView: View {
     @FocusState private var searchFocused: Bool
     @GestureState private var dragOffset: CGFloat = 0
 
-    private let searchColumns = [GridItem(.adaptive(minimum: 110), spacing: 28)]
+    /// 分页与搜索结果共用固定列数:键盘导航需要确定的网格几何。
     private var gridColumns: [GridItem] {
         Array(repeating: GridItem(.flexible(), spacing: 16), count: LayoutStore.columns)
     }
@@ -49,6 +49,13 @@ struct ContentView: View {
         // 页数变化时防止停留在已不存在的页
         .onChange(of: store.pages.count) { _, count in
             state.currentPage = min(state.currentPage, max(0, count - 1))
+        }
+        // 有效查询变化时重置键盘高亮(结果集变了,旧高亮无意义);
+        // 只比较去空白后的值:分页模式误触空格不应清掉高亮
+        .onChange(of: state.query) { old, new in
+            if old.trimmingCharacters(in: .whitespaces) != new.trimmingCharacters(in: .whitespaces) {
+                state.highlightedAppID = nil
+            }
         }
     }
 
@@ -137,6 +144,13 @@ struct ContentView: View {
                     .truncationMode(.tail)
                     .frame(maxWidth: 100)
             }
+            .padding(.vertical, 8)
+            .padding(.horizontal, 6)
+            .background(
+                // 键盘高亮:圆角浅底,与原生选中态一致
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color.primary.opacity(app.id == state.highlightedAppID ? 0.14 : 0))
+            )
         }
         .buttonStyle(.plain)
     }
@@ -152,7 +166,10 @@ struct ContentView: View {
                           : Color.primary.opacity(0.25))
                     .frame(width: 7, height: 7)
                     .contentShape(Circle().scale(2.2))   // 扩大点击热区
-                    .onTapGesture { state.currentPage = index }
+                    .onTapGesture {
+                        state.highlightedAppID = nil     // 手动跳页,旧高亮失效
+                        state.currentPage = index
+                    }
             }
         }
         .padding(.bottom, 26)
@@ -174,14 +191,24 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    LazyVGrid(columns: searchColumns, spacing: 30) {
-                        ForEach(filtered) { app in
-                            appCell(app)
+                // ScrollViewReader:键盘高亮移动时自动滚动到可见区域中央(功能清单要求)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVGrid(columns: gridColumns, spacing: 30) {
+                            ForEach(filtered) { app in
+                                appCell(app).id(app.id)
+                            }
+                        }
+                        .padding(.horizontal, 60)
+                        .padding(.bottom, 60)
+                    }
+                    .onChange(of: state.highlightedAppID) { _, id in
+                        if let id {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                proxy.scrollTo(id, anchor: .center)
+                            }
                         }
                     }
-                    .padding(.horizontal, 60)
-                    .padding(.bottom, 60)
                 }
             }
         }
