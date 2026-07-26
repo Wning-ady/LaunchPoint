@@ -225,11 +225,22 @@ struct ContentView: View {
         ) {
             Button("移到废纸篓", role: .destructive) {
                 if let app = uninstallTarget {
-                    if let error = AppActions.uninstall(appURL: app.url, bundleID: app.bundleID) {
-                        uninstallError = error
-                    } else {
-                        store.refresh()
-                    }
+                    AppActions.uninstall(
+                        appURL: app.url,
+                        bundleID: app.bundleID,
+                        beforeFinderFallback: {
+                            dismiss()   // Finder 的管理员认证弹窗不能被全屏层挡住
+                        },
+                        completion: { error in
+                            if let error {
+                                uninstallError = error
+                                // 覆盖层可能已收起,重新唤起以展示错误
+                                (NSApp.delegate as? AppDelegate)?.showOverlay()
+                            } else {
+                                store.refresh()
+                            }
+                        }
+                    )
                 }
                 uninstallTarget = nil
             }
