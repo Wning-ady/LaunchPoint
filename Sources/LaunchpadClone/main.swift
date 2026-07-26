@@ -12,9 +12,14 @@ final class AppState: ObservableObject {
     @Published var currentPage = 0
     /// 键盘高亮的应用(id = 应用路径);nil = 无高亮。
     @Published var highlightedAppID: String?
+    /// 是否正在拖拽图标(排序中)。
+    @Published var isDragging = false
+    /// 拖拽已被取消(Esc/隐藏/切搜索),同一次按住期间不得重新开始拖拽;松开鼠标后复位。
+    var dragInhibited = false
 
     func flipPage(_ delta: Int) {
-        let count = LayoutStore.shared.pages.count
+        var count = LayoutStore.shared.pages.count
+        if isDragging { count += 1 }   // 拖拽时允许翻到末尾的承接新页
         guard count > 0 else { return }
         currentPage = min(max(currentPage + delta, 0), count - 1)
         // 手动翻页后旧页高亮失效:防止方向键把视图拽回旧页、回车启动看不见的应用
@@ -25,6 +30,8 @@ final class AppState: ObservableObject {
 extension Notification.Name {
     /// 覆盖层重新显示时,通知 SwiftUI 重新聚焦搜索框。
     static let refocusSearch = Notification.Name("LaunchpadRefocusSearch")
+    /// Esc 终止拖拽:通知 SwiftUI 取消进行中的图标拖拽。
+    static let cancelDrag = Notification.Name("LaunchpadCancelDrag")
 }
 
 /// 无边框窗口默认不能成为 key window,覆盖后搜索框才能接收键盘输入。
@@ -44,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerHotKey()
         setUpKeyMonitor()
         setUpScrollMonitor()
+        setUpMouseUpMonitor()
         showOverlay()
     }
 
@@ -77,10 +85,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.post(name: .refocusSearch, object: nil)
     }
 
-    /// 关闭:隐藏待唤起(不退出),焦点还给之前的应用。
+    /// 关闭:隐藏待唤起(不退出),焦点还给之前的应用。拖拽中先取消拖拽,防状态泄漏。
     func dismissOverlay() {
+        if AppState.shared.isDragging {
+            AppState.shared.dragInhibited = true
+            NotificationCenter.default.post(name: .cancelDrag, object: nil)
+        }
         window?.orderOut(nil)
         NSApp.hide(nil)
+    }
+
+    /// 松开鼠标 = 一次按住结束,解除"拖拽已取消"的抑制。
+    private func setUpMouseUpMonitor() {
+        NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { event in
+            AppState.shared.dragInhibited = false
+            return event
+        }
     }
 
     /// 重复执行唤起动作 = 关闭(与 LaunchOS 行为一致)。
@@ -154,9 +174,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                editor.hasMarkedText() {
                 return event
             }
-            // Esc:搜索非空时先清空搜索,否则关闭(还原 LaunchOS 行为)。
+            // Esc:拖拽中先终止拖拽;搜索非空时清空搜索;否则关闭(还原 LaunchOS 行为)。
             if event.keyCode == 53 { // Esc
-                if AppState.shared.query.isEmpty {
+                if AppState.shared.isDragging {
+                    NotificationCenter.default.post(name: .cancelDrag, object: nil)
+                } else if AppState.shared.query.isEmpty {
                     self?.dismissOverlay()
                 } else {
                     AppState.shared.query = ""
