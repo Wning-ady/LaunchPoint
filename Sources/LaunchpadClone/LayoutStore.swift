@@ -191,6 +191,56 @@ final class LayoutStore: ObservableObject {
         commitMutation()
     }
 
+    /// 隐藏 / 取消隐藏应用。
+    func setHidden(_ appID: String, hidden: Bool) {
+        guard let idx = layout.apps.firstIndex(where: { $0.id == appID }) else { return }
+        layout.apps[idx].hidden = hidden
+        commitMutation()
+    }
+
+    /// 设置应用别名(重命名);空串 = 恢复默认名。
+    func setAlias(_ appID: String, alias: String?) {
+        guard let idx = layout.apps.firstIndex(where: { $0.id == appID }) else { return }
+        let trimmed = alias?.trimmingCharacters(in: .whitespaces)
+        layout.apps[idx].alias = (trimmed?.isEmpty ?? true) ? nil : trimmed
+        commitMutation()
+    }
+
+    /// 已隐藏的应用(按显示名排序),供"找回"入口。
+    func hiddenApps() -> [AppItem] {
+        layout.apps.filter(\.hidden)
+            .compactMap { record -> AppItem? in
+                guard var item = scannedByPath[record.id] else { return nil }
+                item.alias = record.alias
+                return item
+            }
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    /// 应用当前所在的文件夹 id(不在文件夹里返回 nil)。
+    func containingFolderID(of appID: String) -> String? {
+        guard let record = layout.apps.first(where: { $0.id == appID }) else { return nil }
+        return layout.groups.first { $0.id == record.groupID && $0.isFolder }?.id
+    }
+
+    /// 应用所在的展示页序(在文件夹里则取文件夹所在页),供"取消隐藏后跳页"。
+    func displayPageIndex(ofApp appID: String) -> Int? {
+        guard let record = layout.apps.first(where: { $0.id == appID }) else { return nil }
+        let pageGroups = layout.groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
+        if let index = pageGroups.firstIndex(where: { $0.id == record.groupID }) { return index }
+        if let folder = layout.groups.first(where: { $0.id == record.groupID && $0.isFolder }) {
+            return pageGroups.firstIndex { $0.page == folder.page }
+        }
+        return nil
+    }
+
+    /// 所有文件夹 (id, 显示名),按页/槽位排序,供"移动到文件夹"菜单。
+    func allFolders() -> [(id: String, name: String)] {
+        layout.groups.filter(\.isFolder)
+            .sorted { ($0.page, $0.order) < ($1.page, $1.order) }
+            .map { ($0.id, ($0.name?.isEmpty == false) ? $0.name! : "未命名文件夹") }
+    }
+
     /// 重命名文件夹。
     func renameFolder(_ folderID: String, to name: String) {
         guard let idx = layout.groups.firstIndex(where: { $0.id == folderID && $0.isFolder })
@@ -232,10 +282,12 @@ final class LayoutStore: ObservableObject {
         save()
     }
 
-    /// 文件夹仅剩一个(或零个)应用时自动解散(还原原生行为)。
+    /// 文件夹仅剩一个(或零个)可见应用时自动解散(还原原生行为)。
+    /// 按可见成员计数:隐藏成员不该撑住一个看起来空了的"幽灵文件夹"。
     private func autoDissolveSingletonFolders() {
         for folder in layout.groups where folder.isFolder {
-            let memberCount = layout.apps.filter { $0.groupID == folder.id }.count
+            let memberCount = layout.apps
+                .filter { $0.groupID == folder.id && !$0.hidden }.count
             if memberCount <= 1,
                let (apps, groups) = Self.applyDissolveFolder(apps: layout.apps,
                                                              groups: layout.groups,
