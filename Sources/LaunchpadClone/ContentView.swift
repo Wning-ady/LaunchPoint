@@ -65,6 +65,12 @@ struct ContentView: View {
 
     private var draggingID: String? { draggingEntry?.id }
 
+    // MARK: 重命名对话框状态
+    @State private var renameTarget: AppItem?
+    @State private var renameText = ""
+    @State private var folderRenameID: String?
+    @State private var folderRenameText = ""
+
     /// onto 模式下被悬停的条目(视觉放大提示)。
     private var ontoHighlightID: String? {
         if case .onto(_, let id) = dropTarget { return id }
@@ -166,6 +172,114 @@ struct ContentView: View {
                 state.highlightedAppID = nil
             }
         }
+        // 布局变更后若展开的文件夹已不存在(被解散),自动收起
+        .onReceive(store.objectWillChange) { _ in
+            DispatchQueue.main.async {
+                if let id = state.openFolderID, !store.isFolderID(id) {
+                    state.openFolderID = nil
+                }
+            }
+        }
+        // 重命名应用对话框
+        .alert("重命名应用", isPresented: Binding(
+            get: { renameTarget != nil },
+            set: { if !$0 { renameTarget = nil } })
+        ) {
+            TextField("名称", text: $renameText)
+            Button("确定") {
+                if let app = renameTarget {
+                    store.setAlias(app.id, alias: renameText)
+                }
+                renameTarget = nil
+            }
+            Button("取消", role: .cancel) { renameTarget = nil }
+        } message: {
+            Text("留空则恢复默认名称")
+        }
+        // 重命名文件夹对话框
+        .alert("重命名文件夹", isPresented: Binding(
+            get: { folderRenameID != nil },
+            set: { if !$0 { folderRenameID = nil } })
+        ) {
+            TextField("名称", text: $folderRenameText)
+            Button("确定") {
+                if let id = folderRenameID {
+                    store.renameFolder(id, to: folderRenameText)
+                }
+                folderRenameID = nil
+            }
+            Button("取消", role: .cancel) { folderRenameID = nil }
+        }
+    }
+
+    // MARK: - 右键菜单
+
+    /// 应用右键菜单(网格/搜索结果/文件夹面板通用)。
+    @ViewBuilder
+    private func appContextMenu(_ app: AppItem) -> some View {
+        Button("在 Finder 中显示") {
+            NSWorkspace.shared.activateFileViewerSelecting([app.url])
+            dismiss()   // 覆盖层在最顶层,不关掉会把 Finder 窗口完全挡住
+        }
+        Divider()
+        // 排除:应用当前所在的文件夹(移入自己所在夹是无效操作)与正展开的文件夹
+        let currentFolder = store.containingFolderID(of: app.id)
+        let folders = store.allFolders().filter {
+            $0.id != state.openFolderID && $0.id != currentFolder
+        }
+        if !folders.isEmpty {
+            Menu("移动到文件夹") {
+                ForEach(folders, id: \.id) { folder in
+                    Button(folder.name) {
+                        store.addToFolder(app.id, folderID: folder.id)
+                    }
+                }
+            }
+        }
+        Button("重命名…") {
+            renameText = app.displayName
+            renameTarget = app
+        }
+        Divider()
+        Button("隐藏") {
+            store.setHidden(app.id, hidden: true)
+        }
+    }
+
+    /// 文件夹图块右键菜单。
+    @ViewBuilder
+    private func folderContextMenu(_ info: FolderInfo) -> some View {
+        Button("重命名…") {
+            folderRenameText = info.name
+            folderRenameID = info.id
+        }
+        Divider()
+        Button("解散文件夹") {
+            store.dissolveFolder(info.id)
+        }
+    }
+
+    /// 空白区域右键菜单。
+    @ViewBuilder
+    private var blankAreaMenu: some View {
+        let hidden = store.hiddenApps()
+        if !hidden.isEmpty {
+            Menu("已隐藏的应用") {
+                ForEach(hidden) { app in
+                    Button(app.displayName) {
+                        store.setHidden(app.id, hidden: false)
+                        // 跳到应用回归的页面,给出可见反馈
+                        if let page = store.displayPageIndex(ofApp: app.id) {
+                            state.currentPage = min(page, max(0, store.pages.count - 1))
+                        }
+                    }
+                }
+            }
+            Divider()
+        }
+        Button("完全退出") {
+            NSApp.terminate(nil)
+        }
     }
 
     // MARK: - 搜索框
@@ -233,6 +347,8 @@ struct ContentView: View {
             }
         }
         .clipped()
+        // 空白区域右键菜单(挂在网格区,不覆盖页码圆点/搜索框;图标有自己的菜单)
+        .contextMenu { blankAreaMenu }
     }
 
     private func pageSwipeGesture(width: CGFloat) -> some Gesture {
@@ -322,6 +438,7 @@ struct ContentView: View {
         )
         .contentShape(Rectangle())
         .onTapGesture { state.openFolderID = info.id }
+        .contextMenu { folderContextMenu(info) }
     }
 
     /// 文件夹展开面板:标题可点击改名,成员网格,点外部/Esc 关闭,可解散。
@@ -749,6 +866,7 @@ struct ContentView: View {
         )
         .contentShape(Rectangle())
         .onTapGesture { launch(app) }
+        .contextMenu { appContextMenu(app) }
     }
 
     // MARK: - 页码圆点

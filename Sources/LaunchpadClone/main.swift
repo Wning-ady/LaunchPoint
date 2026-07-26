@@ -109,7 +109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 重复执行唤起动作 = 关闭(与 LaunchOS 行为一致)。
+    /// 弹窗(重命名等)打开期间不响应:隐藏再唤起会破坏 sheet 的键盘焦点(假模态)。
     @objc func toggleOverlay() {
+        guard window?.attachedSheet == nil else { return }
         if window?.isVisible == true {
             dismissOverlay()
         } else {
@@ -177,6 +179,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 方向键选候选字、回车上屏、Esc 取消组字都必须由 IME 处理
             if let editor = self?.window?.firstResponder as? NSTextView,
                editor.hasMarkedText() {
+                return event
+            }
+            // 弹窗(重命名对话框等)期间按键全部放行,回车/Esc 由弹窗自己处理
+            if self?.window?.attachedSheet != nil {
                 return event
             }
             // Esc 层级:终止拖拽 > 关闭文件夹 > 清空搜索 > 关闭覆盖层(还原 LaunchOS 行为)。
@@ -277,6 +283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
             guard let self,
                   self.window?.isVisible == true,
+                  self.window?.attachedSheet == nil,            // 弹窗期间不翻页
                   AppState.shared.openFolderID == nil,          // 文件夹展开时不翻页
                   AppState.shared.effectiveQuery.isEmpty else { return event } // 搜索结果照常滚动
 
