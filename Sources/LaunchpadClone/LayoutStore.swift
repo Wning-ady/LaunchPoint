@@ -79,11 +79,15 @@ final class LayoutStore: ObservableObject {
         }
     }
 
+    /// 上次扫描结果(路径 → AppItem),供不重扫磁盘的快速重建(如拖拽移动)使用。
+    private var scannedByPath: [String: AppItem] = [:]
+
     /// 扫描磁盘并与已存布局对账,然后刷新展示列表并落盘。
     func refresh() {
         let sources = layout.sources.filter(\.enabled).map(\.path)
         let scanned = AppScanner.scan(sources: sources)
         let byPath = Dictionary(uniqueKeysWithValues: scanned.map { ($0.id, $0) })
+        scannedByPath = byPath
 
         // 1. 移除已卸载的应用
         layout.apps.removeAll { byPath[$0.id] == nil }
@@ -107,15 +111,109 @@ final class LayoutStore: ObservableObject {
 
         // 3. 容量归一:超出每页容量的应用向后页溢出(只向前溢、不回填,保护空间记忆)
         normalizeCapacity()
+        pruneTrailingEmptyPageGroups()
 
-        // 4. 生成分页展示列表
+        // 4. 生成分页展示列表并落盘
+        rebuildPages()
+        save()
+    }
+
+    /// 把应用移动到指定 (页, 槽位)。slot 为"移除被拖应用后"目标页内的插入位置。
+    /// toPage 超出现有页数时自动创建承接新页。移动后归一容量、重建展示并落盘。
+    func moveApp(_ appID: String, toPage: Int, slot: Int) {
+        guard let (newApps, newGroups) = Self.applyMove(apps: layout.apps,
+                                                        groups: layout.groups,
+                                                        appID: appID,
+                                                        toPage: toPage,
+                                                        slot: slot) else { return }
+        layout.apps = newApps
+        layout.groups = newGroups
+        normalizeCapacity()
+        pruneTrailingEmptyPageGroups()
+        rebuildPages()
+        save()
+    }
+
+    /// 删除持久层中"尾部"的空页组(中间空页保留,尊重用户留白)。
+    /// 不清理会导致幻影远页:新装应用会被追加到 max(page) 的空组,凭空多出空白页。
+    private func pruneTrailingEmptyPageGroups() {
+        var pageGroups = layout.groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
+        while pageGroups.count > 1 {
+            guard let last = pageGroups.last,
+                  !layout.apps.contains(where: { $0.groupID == last.id }) else { break }
+            layout.groups.removeAll { $0.id == last.id }
+            pageGroups.removeLast()
+        }
+    }
+
+    /// 纯函数版移动逻辑,便于独立测试。找不到应用时返回 nil。
+    static func applyMove(apps: [AppRecord], groups: [GroupRecord],
+                          appID: String, toPage: Int, slot: Int)
+        -> (apps: [AppRecord], groups: [GroupRecord])? {
+        var apps = apps
+        var groups = groups
+        guard let recordIndex = apps.firstIndex(where: { $0.id == appID }) else { return nil }
+
+        var pageGroups = groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
+        guard !pageGroups.isEmpty, toPage >= 0 else { return nil }
+
+        // 拖到最后一页之后:自动创建承接新页
+        while toPage >= pageGroups.count {
+            let nextPage = (pageGroups.map(\.page).max() ?? -1) + 1
+            let newGroup = GroupRecord(id: "page-\(nextPage)", isFolder: false,
+                                       name: nil, page: nextPage, order: nextPage)
+            groups.append(newGroup)
+            pageGroups.append(newGroup)
+        }
+
+        let target = pageGroups[toPage]
+        let sourceGroupID = apps[recordIndex].groupID
+
+        // 目标页现有成员(不含被拖应用),按 order 排列。
+        // UI 传入的 slot 是"可见序"槽位:映射为全记录插入点,隐藏记录保持相对位置。
+        let targetIndices = apps.indices
+            .filter { apps[$0].groupID == target.id && $0 != recordIndex }
+            .sorted { apps[$0].order < apps[$1].order }
+        let visiblePositions = targetIndices.enumerated()
+            .filter { !apps[$0.element].hidden }
+            .map(\.offset)
+        let visibleSlot = min(max(slot, 0), visiblePositions.count)
+        let insertAt = visibleSlot < visiblePositions.count
+            ? visiblePositions[visibleSlot]
+            : targetIndices.count
+
+        var finalOrder: [Int] = []
+        for (i, idx) in targetIndices.enumerated() {
+            if i == insertAt { finalOrder.append(recordIndex) }
+            finalOrder.append(idx)
+        }
+        if finalOrder.count == targetIndices.count { finalOrder.append(recordIndex) }
+        for (order, idx) in finalOrder.enumerated() {
+            apps[idx].order = order
+        }
+        apps[recordIndex].groupID = target.id
+
+        // 源页压实(跨页移动时)
+        if sourceGroupID != target.id {
+            let sourceIndices = apps.indices
+                .filter { apps[$0].groupID == sourceGroupID }
+                .sorted { apps[$0].order < apps[$1].order }
+            for (i, idx) in sourceIndices.enumerated() {
+                apps[idx].order = i
+            }
+        }
+        return (apps, groups)
+    }
+
+    /// 从当前 layout + 上次扫描结果重建分页展示列表(不重扫磁盘、不落盘)。
+    private func rebuildPages() {
         let pageGroups = layout.groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
         pages = pageGroups.map { pg in
             layout.apps
                 .filter { $0.groupID == pg.id && !$0.hidden }
                 .sorted { $0.order < $1.order }
                 .compactMap { record -> AppItem? in
-                    guard var item = byPath[record.id] else { return nil }
+                    guard var item = scannedByPath[record.id] else { return nil }
                     item.alias = record.alias
                     return item
                 }
@@ -125,8 +223,6 @@ final class LayoutStore: ObservableObject {
             pages.removeLast()
         }
         items = pages.flatMap { $0 }
-
-        save()
     }
 
     /// 每页最多 capacity 个;超出的按序搬到下一页开头,必要时自动建新页。
