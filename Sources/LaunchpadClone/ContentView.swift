@@ -70,6 +70,10 @@ struct ContentView: View {
     @State private var renameText = ""
     @State private var folderRenameID: String?
     @State private var folderRenameText = ""
+    // MARK: 简介与卸载状态
+    @State private var infoTarget: AppItem?
+    @State private var uninstallTarget: AppItem?
+    @State private var uninstallError: String?
 
     /// onto 模式下被悬停的条目(视觉放大提示)。
     private var ontoHighlightID: String? {
@@ -210,6 +214,41 @@ struct ContentView: View {
             }
             Button("取消", role: .cancel) { folderRenameID = nil }
         }
+        // 应用简介面板
+        .sheet(item: $infoTarget) { app in
+            AppInfoPanel(app: app)
+        }
+        // 卸载确认
+        .alert("卸载“\(uninstallTarget?.displayName ?? "")”?", isPresented: Binding(
+            get: { uninstallTarget != nil },
+            set: { if !$0 { uninstallTarget = nil } })
+        ) {
+            Button("移到废纸篓", role: .destructive) {
+                if let app = uninstallTarget {
+                    if let error = AppActions.uninstall(appURL: app.url, bundleID: app.bundleID) {
+                        uninstallError = error
+                    } else {
+                        store.refresh()
+                    }
+                }
+                uninstallTarget = nil
+            }
+            Button("取消", role: .cancel) { uninstallTarget = nil }
+        } message: {
+            let residuals = AppActions.residualPaths(bundleID: uninstallTarget?.bundleID).count
+            Text(residuals > 0
+                 ? "应用本体与 \(residuals) 项残留数据(缓存、偏好设置等)将一并移到废纸篓,可随时恢复。"
+                 : "应用将被移到废纸篓,可随时恢复。")
+        }
+        // 卸载失败提示
+        .alert("卸载失败", isPresented: Binding(
+            get: { uninstallError != nil },
+            set: { if !$0 { uninstallError = nil } })
+        ) {
+            Button("好", role: .cancel) { uninstallError = nil }
+        } message: {
+            Text(uninstallError ?? "")
+        }
     }
 
     // MARK: - 右键菜单
@@ -220,6 +259,12 @@ struct ContentView: View {
         Button("在 Finder 中显示") {
             NSWorkspace.shared.activateFileViewerSelecting([app.url])
             dismiss()   // 覆盖层在最顶层,不关掉会把 Finder 窗口完全挡住
+        }
+        Button("显示简介") {
+            infoTarget = app
+        }
+        Button("添加到程序坞") {
+            AppActions.addToDock(app.url)
         }
         Divider()
         // 排除:应用当前所在的文件夹(移入自己所在夹是无效操作)与正展开的文件夹
@@ -243,6 +288,13 @@ struct ContentView: View {
         Divider()
         Button("隐藏") {
             store.setHidden(app.id, hidden: true)
+        }
+        // 系统应用受 SIP 保护不可卸载,不显示入口
+        if !app.id.hasPrefix("/System/") {
+            Divider()
+            Button("卸载…") {
+                uninstallTarget = app
+            }
         }
     }
 
@@ -931,5 +983,68 @@ struct ContentView: View {
     private func launch(_ app: AppItem) {
         NSWorkspace.shared.open(app.url)
         dismiss()
+    }
+}
+
+/// 应用简介面板:图标、名称、版本、Bundle ID、大小、修改日期、位置。
+struct AppInfoPanel: View {
+    let app: AppItem
+    @Environment(\.dismiss) private var dismissSheet
+    @State private var sizeText = "计算中…"
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(nsImage: app.icon)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 64, height: 64)
+            Text(app.displayName)
+                .font(.title3.weight(.semibold))
+            if app.alias != nil {
+                Text("原名:\(app.name)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            VStack(spacing: 8) {
+                infoRow("版本", AppActions.versionString(of: app.url) ?? "—")
+                infoRow("Bundle ID", app.bundleID ?? "—")
+                infoRow("大小", sizeText)
+                infoRow("修改日期", AppActions.modifiedDate(of: app.url)
+                    .map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "—")
+                infoRow("位置", app.url.deletingLastPathComponent().path)
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("关闭") { dismissSheet() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 400)
+        .task {
+            // 目录遍历较慢,后台计算
+            let bytes = await Task.detached(priority: .utility) {
+                AppActions.size(of: app.url)
+            }.value
+            sizeText = AppActions.formatBytes(bytes)
+        }
+    }
+
+    private func infoRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(label)
+                .foregroundStyle(.secondary)
+                .frame(width: 76, alignment: .trailing)
+            Text(value)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.system(size: 12.5))
     }
 }
