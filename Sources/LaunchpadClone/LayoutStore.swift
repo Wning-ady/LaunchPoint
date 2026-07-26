@@ -50,8 +50,15 @@ struct Layout: Codable {
 final class LayoutStore: ObservableObject {
     static let shared = LayoutStore()
 
-    /// 展示用列表:已按布局排序、剔除隐藏、附加别名。
+    /// 网格容量(后续做成设置项,参照 LaunchOS 的 columns/rows)。
+    static let columns = 7
+    static let rows = 5
+    static var capacity: Int { columns * rows }
+
+    /// 展示用扁平列表(搜索用):已按布局排序、剔除隐藏、附加别名。
     @Published private(set) var items: [AppItem] = []
+    /// 分页展示列表:每页最多 capacity 个。
+    @Published private(set) var pages: [[AppItem]] = []
 
     private var layout: Layout
 
@@ -98,23 +105,68 @@ final class LayoutStore: ObservableObject {
             }
         }
 
-        // 3. 生成展示列表:按 (组页码, 组槽位, 组内顺序) 排列,剔除隐藏
-        let position = Dictionary(uniqueKeysWithValues: layout.groups.map { ($0.id, ($0.page, $0.order)) })
-        items = layout.apps
-            .filter { !$0.hidden }
-            .sorted { a, b in
-                let ga = position[a.groupID] ?? (0, 0)
-                let gb = position[b.groupID] ?? (0, 0)
-                if ga != gb { return ga < gb }
-                return a.order < b.order
-            }
-            .compactMap { record in
-                guard var item = byPath[record.id] else { return nil }
-                item.alias = record.alias
-                return item
-            }
+        // 3. 容量归一:超出每页容量的应用向后页溢出(只向前溢、不回填,保护空间记忆)
+        normalizeCapacity()
+
+        // 4. 生成分页展示列表
+        let pageGroups = layout.groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
+        pages = pageGroups.map { pg in
+            layout.apps
+                .filter { $0.groupID == pg.id && !$0.hidden }
+                .sorted { $0.order < $1.order }
+                .compactMap { record -> AppItem? in
+                    guard var item = byPath[record.id] else { return nil }
+                    item.alias = record.alias
+                    return item
+                }
+        }
+        // 去掉尾部空页(中间的空页保留,尊重用户留白)
+        while pages.count > 1, pages.last?.isEmpty == true {
+            pages.removeLast()
+        }
+        items = pages.flatMap { $0 }
 
         save()
+    }
+
+    /// 每页最多 capacity 个;超出的按序搬到下一页开头,必要时自动建新页。
+    private func normalizeCapacity() {
+        var pageGroups = layout.groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
+        guard !pageGroups.isEmpty else { return }
+
+        var i = 0
+        while i < pageGroups.count {
+            let pg = pageGroups[i]
+            let inPage = layout.apps.indices
+                .filter { layout.apps[$0].groupID == pg.id }
+                .sorted { layout.apps[$0].order < layout.apps[$1].order }
+
+            if inPage.count > Self.capacity {
+                let overflow = Array(inPage[Self.capacity...])
+
+                // 找或建下一页
+                let next: GroupRecord
+                if i + 1 < pageGroups.count {
+                    next = pageGroups[i + 1]
+                } else {
+                    next = GroupRecord(id: "page-\(pg.page + 1)", isFolder: false,
+                                       name: nil, page: pg.page + 1, order: pg.page + 1)
+                    layout.groups.append(next)
+                    pageGroups.append(next)
+                }
+
+                // 下一页原有内容整体后移,溢出的插到开头(保持相对顺序)
+                let shift = overflow.count
+                for idx in layout.apps.indices where layout.apps[idx].groupID == next.id {
+                    layout.apps[idx].order += shift
+                }
+                for (offset, idx) in overflow.enumerated() {
+                    layout.apps[idx].groupID = next.id
+                    layout.apps[idx].order = offset
+                }
+            }
+            i += 1
+        }
     }
 
     private func save() {

@@ -2,10 +2,18 @@ import AppKit
 import SwiftUI
 import Carbon.HIToolbox
 
-/// 全局共享状态,让 AppKit 层(按键监听)与 SwiftUI 层互通。
+/// 全局共享状态,让 AppKit 层(按键/滚轮监听)与 SwiftUI 层互通。
 final class AppState: ObservableObject {
     static let shared = AppState()
     @Published var query = ""
+    /// 当前页码。隐藏后不重置——还原"上次打开的位置"(原生默认行为)。
+    @Published var currentPage = 0
+
+    func flipPage(_ delta: Int) {
+        let count = LayoutStore.shared.pages.count
+        guard count > 0 else { return }
+        currentPage = min(max(currentPage + delta, 0), count - 1)
+    }
 }
 
 extension Notification.Name {
@@ -28,7 +36,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setUpWindow()
         setUpStatusItem()
         registerHotKey()
-        setUpEscMonitor()
+        setUpKeyMonitor()
+        setUpScrollMonitor()
         showOverlay()
     }
 
@@ -128,11 +137,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
     }
 
-    // MARK: - Esc
+    // MARK: - 键盘
 
-    private func setUpEscMonitor() {
-        // Esc:搜索非空时先清空搜索,否则关闭(还原 LaunchOS 行为)。
+    private func setUpKeyMonitor() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            // Esc:搜索非空时先清空搜索,否则关闭(还原 LaunchOS 行为)。
             if event.keyCode == 53 { // Esc
                 if AppState.shared.query.isEmpty {
                     self?.dismissOverlay()
@@ -141,7 +150,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 return nil
             }
+            // ⌘← / ⌘→ 翻页(还原原生启动台快捷键)
+            if event.modifierFlags.contains(.command), AppState.shared.query.isEmpty {
+                if event.keyCode == 123 { AppState.shared.flipPage(-1); return nil } // ←
+                if event.keyCode == 124 { AppState.shared.flipPage(1); return nil }  // →
+            }
             return event
+        }
+    }
+
+    // MARK: - 滚轮翻页
+
+    private var lastWheelFlip = Date.distantPast
+
+    /// 滚轮/触控板翻页。一次滚动只翻一页:
+    /// 用冷却时间挡掉平滑滚轮与惯性滚动带来的连续触发(LaunchOS 也专门优化过这点)。
+    private func setUpScrollMonitor() {
+        NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            guard let self,
+                  self.window?.isVisible == true,
+                  AppState.shared.query.isEmpty else { return event } // 搜索结果照常滚动
+
+            let dx = event.scrollingDeltaX
+            let dy = event.scrollingDeltaY
+            let delta = abs(dx) > abs(dy) ? dx : dy
+            // 触控板/平滑滚轮的增量细腻,阈值高一些;分级滚轮一格就该翻
+            let threshold: CGFloat = event.hasPreciseScrollingDeltas ? 25 : 3
+
+            if abs(delta) >= threshold,
+               Date().timeIntervalSince(self.lastWheelFlip) > 0.35 {
+                self.lastWheelFlip = Date()
+                AppState.shared.flipPage(delta < 0 ? 1 : -1)
+            }
+            return nil
         }
     }
 }
