@@ -218,6 +218,10 @@ struct ContentView: View {
         .sheet(item: $infoTarget) { app in
             AppInfoPanel(app: app)
         }
+        // 设置面板(⌘, / 空白右键 / 菜单栏入口)
+        .sheet(isPresented: $state.showSettings) {
+            SettingsPanel()
+        }
         // 卸载确认
         .alert("卸载“\(uninstallTarget?.displayName ?? "")”?", isPresented: Binding(
             get: { uninstallTarget != nil },
@@ -340,6 +344,10 @@ struct ContentView: View {
             }
             Divider()
         }
+        Button("设置…") {
+            state.showSettings = true
+        }
+        Divider()
         Button("完全退出") {
             NSApp.terminate(nil)
         }
