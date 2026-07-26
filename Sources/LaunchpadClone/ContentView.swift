@@ -1,6 +1,26 @@
 import SwiftUI
 import AppKit
 
+/// 使用 AppKit 视觉效果承载窗口级毛玻璃，避免 SwiftUI material 被透明窗口裁剪。
+private struct VisualEffectBackground: NSViewRepresentable {
+    let material: NSVisualEffectView.Material
+    var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = .active
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
+        nsView.blendingMode = blendingMode
+        nsView.state = .active
+    }
+}
+
 /// 收集单元格尺寸(只取高度用于行距推算;水平几何用纯数学,不依赖测量)。
 struct CellSizeKey: PreferenceKey {
     static var defaultValue: CGSize = .zero
@@ -25,11 +45,13 @@ struct ContentView: View {
     @ObservedObject private var store = LayoutStore.shared
     @FocusState private var searchFocused: Bool
     @GestureState private var pageSwipeOffset: CGFloat = 0
+    @State private var wallpaperImage: NSImage?
+    @State private var wallpaperPath = ""
 
     // MARK: 网格几何常量(与 pageView 布局参数保持一致)
     private static let hPadding: CGFloat = 70
     private static let colSpacing: CGFloat = 16
-    private static let rowSpacing: CGFloat = 26
+    private static let maxRowSpacing: CGFloat = 26
     private static let gridTop: CGFloat = 20
     private static let edgeMargin: CGFloat = 48
 
@@ -53,6 +75,7 @@ struct ContentView: View {
     @State private var dragOrigin: OriginCell?             // 起拖格
     @State private var hasLeftOrigin = false               // 指针是否已离开起拖格
     @State private var containerWidth: CGFloat = 0         // 分页容器宽度(即页宽)
+    @State private var containerHeight: CGFloat = 0        // 分页容器高度(用于动态图标尺寸)
     @State private var cellHeight: CGFloat = 120           // 单元格高度(测量,供行距推算)
     @State private var edgeFlipWork: DispatchWorkItem?
     @State private var pagingAreaFrame: CGRect = .zero     // 分页容器的窗口坐标 frame
@@ -62,6 +85,7 @@ struct ContentView: View {
     @State private var panelDragLocation: CGPoint = .zero  // 窗口坐标
     @State private var folderPanelHidden = false           // 拖出边界后面板隐去(视图保留,手势不断)
     @State private var panelFrame: CGRect = .zero          // 面板窗口坐标 frame
+    @State private var hoveredEntryID: String?             // 鼠标悬停的图标,提供轻量的反馈
 
     private var draggingID: String? { draggingEntry?.id }
 
@@ -87,6 +111,31 @@ struct ContentView: View {
               count: LayoutStore.columns)
     }
 
+    /// 图标随网格列数/行数缩放，避免设置网格后只有槽位变化而图标大小不变。
+    private var gridIconSize: CGFloat {
+        guard containerWidth > 0, containerHeight > 0 else { return 72 }
+        let columns = LayoutStore.columns
+        let cellWidth = (containerWidth - 2 * Self.hPadding
+                     - CGFloat(columns - 1) * Self.colSpacing) / CGFloat(columns)
+        let rowPitch = (containerHeight - Self.gridTop - 18
+                        - CGFloat(max(0, LayoutStore.rows - 1)) * gridRowSpacing)
+            / CGFloat(LayoutStore.rows)
+        let widthBound = min(104, max(48, cellWidth * 0.64))
+        let heightBound = min(104, max(48, rowPitch - 38))
+        return min(widthBound, heightBound)
+    }
+
+    /// 行数越多，行间距越紧，保证网格仍然能在当前页面内完整显示。
+    private var gridRowSpacing: CGFloat {
+        guard containerHeight > 0 else { return Self.maxRowSpacing }
+        let roughPitch = containerHeight / CGFloat(max(1, LayoutStore.rows))
+        return min(Self.maxRowSpacing, max(10, roughPitch * 0.14))
+    }
+
+    private var gridLabelFontSize: CGFloat {
+        min(14, max(10, gridIconSize * 0.17))
+    }
+
     /// 展示用页面:拖拽时用预览布局,并在末尾提供一个空承接页。
     private var displayPages: [[PageEntry]] {
         if let previewPages { return previewPages }
@@ -102,6 +151,10 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
+            overlayBackground
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+
             mainContent
 
             // 文件夹展开面板(盖在网格之上;拖出时隐去但视图保留,手势不断)
@@ -120,7 +173,9 @@ struct ContentView: View {
                     .zIndex(30)
             }
         }
-        .animation(.spring(response: 0.3, dampingFraction: 0.85), value: state.openFolderID)
+        .animation(.easeInOut(duration: 0.24), value: state.openFolderID)
+        .onAppear { loadWallpaperIfNeeded() }
+        .onChange(of: state.backgroundStyle) { _, _ in loadWallpaperIfNeeded(force: true) }
     }
 
     private var mainContent: some View {
@@ -128,27 +183,30 @@ struct ContentView: View {
             searchField
 
             if state.effectiveQuery.isEmpty {
-                pagedGrid
-                pageDots
+                if state.viewMode == .scrolling {
+                    scrollingGrid
+                } else {
+                    pagedGrid
+                    pageDots
+                }
             } else {
                 searchResults
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.ultraThinMaterial)
         .contentShape(Rectangle())
         .onTapGesture { dismiss() }   // 点击空白区域关闭(图标/搜索框/圆点会自行消费点击)
         .onAppear {
-            store.refresh()
+            store.refreshAsync()
             focusSearch()
-            // 预热搜索键(含 ICU 转换器首次初始化的约 40ms),挪出打字路径
-            DispatchQueue.main.async {
-                SearchEngine.prewarm(store.items)
-            }
+        }
+        .onReceive(store.$items) { items in
+            // 扫描完成后预热搜索键，避免首次输入卡顿。
+            SearchEngine.prewarm(items)
         }
         // 每次从菜单栏/快捷键重新唤起时:重新对账(捕捉新装/卸载)并聚焦搜索框
         .onReceive(NotificationCenter.default.publisher(for: .refocusSearch)) { _ in
-            store.refresh()
+            store.refreshAsync()
             focusSearch()
         }
         // Esc/隐藏 终止拖拽:不落盘,布局弹回原状;同一次按住期间不得重新开始
@@ -218,10 +276,6 @@ struct ContentView: View {
         .sheet(item: $infoTarget) { app in
             AppInfoPanel(app: app)
         }
-        // 设置面板(⌘, / 空白右键 / 菜单栏入口)
-        .sheet(isPresented: $state.showSettings) {
-            SettingsPanel()
-        }
         // 卸载确认
         .alert("卸载“\(uninstallTarget?.displayName ?? "")”?", isPresented: Binding(
             get: { uninstallTarget != nil },
@@ -241,7 +295,7 @@ struct ContentView: View {
                                 // 覆盖层可能已收起,重新唤起以展示错误
                                 (NSApp.delegate as? AppDelegate)?.showOverlay()
                             } else {
-                                store.refresh()
+                                store.refreshAsync()
                             }
                         }
                     )
@@ -263,6 +317,47 @@ struct ContentView: View {
             Button("好", role: .cancel) { uninstallError = nil }
         } message: {
             Text(uninstallError ?? "")
+        }
+    }
+
+    @ViewBuilder
+    private var overlayBackground: some View {
+        if state.backgroundStyle == .wallpaper, let image = wallpaperImage {
+            ZStack {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .clipped()
+                if state.blurWallpaper {
+                    // withinWindow 由 AppKit 在 GPU 上处理，避免 SwiftUI 每帧重算高斯模糊。
+                    VisualEffectBackground(material: .hudWindow, blendingMode: .withinWindow)
+                        .opacity(0.78)
+                } else {
+                    Color.black.opacity(0.16)
+                }
+            }
+        } else {
+            VisualEffectBackground(material: .hudWindow)
+        }
+    }
+
+    /// 壁纸只在设置变化或首次出现时读取一次，拖拽/翻页不再触发磁盘 IO。
+    private func loadWallpaperIfNeeded(force: Bool = false) {
+        guard state.backgroundStyle == .wallpaper,
+              let screen = NSScreen.main,
+              let url = NSWorkspace.shared.desktopImageURL(for: screen) else {
+            wallpaperImage = nil
+            wallpaperPath = ""
+            return
+        }
+        guard force || wallpaperPath != url.path || wallpaperImage == nil else { return }
+        wallpaperPath = url.path
+        DispatchQueue.global(qos: .utility).async {
+            guard let data = try? Data(contentsOf: url),
+                  let image = NSImage(data: data) else { return }
+            DispatchQueue.main.async {
+                wallpaperImage = image
+            }
         }
     }
 
@@ -345,7 +440,7 @@ struct ContentView: View {
             Divider()
         }
         Button("设置…") {
-            state.showSettings = true
+            (NSApp.delegate as? AppDelegate)?.showSettingsWindow()
         }
         Divider()
         Button("完全退出") {
@@ -393,7 +488,6 @@ struct ContentView: View {
                 }
                 // 拖拽位移实时叠加到页面偏移上,还原跟手感
                 .offset(x: -CGFloat(state.currentPage) * width + pageSwipeOffset)
-                .animation(.spring(response: 0.32, dampingFraction: 0.85), value: state.currentPage)
                 .gesture(pageSwipeGesture(width: width))
 
                 // 跟随指针的浮动图标(拖拽中)
@@ -407,10 +501,13 @@ struct ContentView: View {
             .coordinateSpace(name: "pagingArea")         // 指针/浮动图标用:静止坐标系
             .onAppear {
                 containerWidth = width
+                containerHeight = geo.size.height
                 pagingAreaFrame = geo.frame(in: .global)
             }
-            .onChange(of: geo.size.width) { _, w in
+            .onChange(of: geo.size) { _, size in
+                let w = size.width
                 containerWidth = w
+                containerHeight = size.height
                 pagingAreaFrame = geo.frame(in: .global)
             }
             .onPreferenceChange(CellSizeKey.self) { size in
@@ -419,6 +516,22 @@ struct ContentView: View {
         }
         .clipped()
         // 空白区域右键菜单(挂在网格区,不覆盖页码圆点/搜索框;图标有自己的菜单)
+        .contentShape(Rectangle())
+        .contextMenu { blankAreaMenu }
+    }
+
+    private var scrollingGrid: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            LazyVGrid(columns: gridColumns, spacing: gridRowSpacing) {
+                ForEach(displayPages.flatMap { $0 }) { entry in
+                    entryCell(entry)
+                }
+            }
+            .padding(.horizontal, Self.hPadding)
+            .padding(.top, Self.gridTop)
+            .padding(.bottom, 36)
+        }
+        .contentShape(Rectangle())
         .contextMenu { blankAreaMenu }
     }
 
@@ -439,7 +552,7 @@ struct ContentView: View {
     }
 
     private func pageView(_ entries: [PageEntry]) -> some View {
-        LazyVGrid(columns: gridColumns, spacing: Self.rowSpacing) {
+        LazyVGrid(columns: gridColumns, spacing: gridRowSpacing) {
             ForEach(entries) { entry in
                 entryCell(entry)
                     // onto 悬停:目标条目放大提示"松手即建夹/入夹"
@@ -455,6 +568,8 @@ struct ContentView: View {
         }
         .padding(.horizontal, Self.hPadding)
         .padding(.top, Self.gridTop)
+        .animation(.easeInOut(duration: 0.28), value: gridIconSize)
+        .animation(.easeInOut(duration: 0.28), value: gridRowSpacing)
     }
 
     @ViewBuilder
@@ -483,16 +598,16 @@ struct ContentView: View {
                     if i < info.preview.count {
                         Image(nsImage: info.preview[i].icon)
                             .resizable()
-                            .interpolation(.high)
-                            .frame(width: 24, height: 24)
+                            .interpolation(.medium)
+                            .frame(width: gridIconSize * 0.34, height: gridIconSize * 0.34)
                             .clipShape(RoundedRectangle(cornerRadius: 5))
                     } else {
-                        Color.clear.frame(width: 24, height: 24)
+                        Color.clear.frame(width: gridIconSize * 0.34, height: gridIconSize * 0.34)
                     }
                 }
             }
             .padding(8)
-            .frame(width: 72, height: 72)
+            .frame(width: gridIconSize, height: gridIconSize)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
             Text(info.name.isEmpty ? "未命名文件夹" : info.name)
                 .font(.system(size: 12))
@@ -505,10 +620,18 @@ struct ContentView: View {
         .padding(.horizontal, 6)
         .background(
             RoundedRectangle(cornerRadius: 16)
-                .fill(Color.primary.opacity(info.id == state.highlightedAppID ? 0.14 : 0))
+                .fill(Color.primary.opacity(info.id == state.highlightedAppID
+                                             ? 0.14
+                                             : hoveredEntryID == info.id ? 0.08 : 0))
         )
+        .scaleEffect(hoveredEntryID == info.id ? 1.035 : 1)
         .contentShape(Rectangle())
         .onTapGesture { state.openFolderID = info.id }
+        .onHover { inside in
+            guard !AppState.shared.isDragging else { return }
+            hoveredEntryID = inside ? info.id : nil
+        }
+        .animation(.easeOut(duration: 0.16), value: hoveredEntryID == info.id)
         .contextMenu { folderContextMenu(info) }
     }
 
@@ -683,7 +806,7 @@ struct ContentView: View {
         let pitch = colWidth + Self.colSpacing
         let col = Int(floor((xInPage - Self.hPadding) / pitch))
         guard col >= 0, col < cols else { return nil }
-        let rowPitch = cellHeight + Self.rowSpacing
+        let rowPitch = cellHeight + gridRowSpacing
         let row = Int(floor((y - Self.gridTop) / rowPitch))
         guard row >= 0, row < LayoutStore.rows else { return nil }
         return row * cols + col
@@ -745,7 +868,7 @@ struct ContentView: View {
         let fracX = xInGrid - CGFloat(col) * pitch
         guard fracX > colWidth * 0.22, fracX < colWidth * 0.78 else { return nil }
 
-        let rowPitch = cellHeight + Self.rowSpacing
+        let rowPitch = cellHeight + gridRowSpacing
         let yInGrid = y - Self.gridTop
         let row = Int(floor(yInGrid / rowPitch))
         guard row >= 0, row < LayoutStore.rows else { return nil }
@@ -767,7 +890,7 @@ struct ContentView: View {
         var col = Int(floor((xInGrid - colWidth / 2) / pitch)) + 1
         col = min(max(col, 0), cols)
 
-        let rowPitch = cellHeight + Self.rowSpacing
+        let rowPitch = cellHeight + gridRowSpacing
         var row = Int(floor((y - Self.gridTop) / rowPitch))
         row = min(max(row, 0), LayoutStore.rows - 1)
 
@@ -919,24 +1042,32 @@ struct ContentView: View {
         VStack(spacing: 8) {
             Image(nsImage: app.icon)
                 .resizable()
-                .interpolation(.high)
-                .frame(width: 72, height: 72)
+                .interpolation(.medium)
+                .frame(width: gridIconSize, height: gridIconSize)
             Text(app.displayName)
-                .font(.system(size: 12))
+                .font(.system(size: gridLabelFontSize))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(maxWidth: 100)
+                .frame(maxWidth: max(92, gridIconSize * 1.4))
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 6)
         .background(
             // 键盘高亮:圆角浅底,与原生选中态一致
             RoundedRectangle(cornerRadius: 16)
-                .fill(Color.primary.opacity(app.id == state.highlightedAppID ? 0.14 : 0))
+                .fill(Color.primary.opacity(app.id == state.highlightedAppID
+                                             ? 0.14
+                                             : hoveredEntryID == app.id ? 0.08 : 0))
         )
+        .scaleEffect(hoveredEntryID == app.id ? 1.035 : 1)
         .contentShape(Rectangle())
         .onTapGesture { launch(app) }
+        .onHover { inside in
+            guard !AppState.shared.isDragging else { return }
+            hoveredEntryID = inside ? app.id : nil
+        }
+        .animation(.easeOut(duration: 0.16), value: hoveredEntryID == app.id)
         .contextMenu { appContextMenu(app) }
     }
 

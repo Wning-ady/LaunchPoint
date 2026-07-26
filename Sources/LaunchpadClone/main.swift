@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Carbon.HIToolbox
+import ServiceManagement
 
 /// 全局共享状态,让 AppKit 层(按键/滚轮监听)与 SwiftUI 层互通。
 final class AppState: ObservableObject {
@@ -22,14 +23,31 @@ final class AppState: ObservableObject {
     var folderTitleEditing = false
     /// 设置面板是否打开(⌘, / 菜单入口)。
     @Published var showSettings = false
+    /// 覆盖层背景设置,由设置页实时修改。
+    @Published var backgroundStyle = Settings.backgroundStyle
+    @Published var blurWallpaper = Settings.blurWallpaper
+    @Published var viewMode = Settings.viewMode
+
+    func setBackgroundStyle(_ style: BackgroundStyle) {
+        Settings.backgroundStyle = style
+        backgroundStyle = style
+    }
+
+    func setBlurWallpaper(_ enabled: Bool) {
+        Settings.blurWallpaper = enabled
+        blurWallpaper = enabled
+    }
 
     func flipPage(_ delta: Int) {
         var count = LayoutStore.shared.pages.count
         if isDragging { count += 1 }   // 拖拽时允许翻到末尾的承接新页
         guard count > 0 else { return }
-        currentPage = min(max(currentPage + delta, 0), count - 1)
-        // 手动翻页后旧页高亮失效:防止方向键把视图拽回旧页、回车启动看不见的应用
-        highlightedAppID = nil
+        withAnimation(.interactiveSpring(response: 0.48, dampingFraction: 0.88,
+                                          blendDuration: 0.16)) {
+            currentPage = min(max(currentPage + delta, 0), count - 1)
+            // 手动翻页后旧页高亮失效:防止方向键把视图拽回旧页、回车启动看不见的应用
+            highlightedAppID = nil
+        }
     }
 }
 
@@ -48,8 +66,13 @@ final class OverlayWindow: NSWindow {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: OverlayWindow?
+    private var settingsWindow: NSWindow?
     private var statusItem: NSStatusItem?
     private var hotKeyRef: EventHotKeyRef?
+    private var f4HotKeyRef: EventHotKeyRef?
+    private var globalMouseMonitor: Any?
+    private var localMouseMonitor: Any?
+    private var hotCornerArmed = true
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 把持久化设置注入布局层(布局层不直接依赖设置层,便于独立测试)
@@ -61,13 +84,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setUpKeyMonitor()
         setUpScrollMonitor()
         setUpMouseUpMonitor()
+        setUpHotCornerMonitor()
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(screenParametersChanged),
+                                               name: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil)
         showOverlay()
     }
 
     // MARK: - 覆盖层窗口
 
     private func setUpWindow() {
-        let frame = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let frame = selectedScreen().frame
         let window = OverlayWindow(contentRect: frame,
                                    styleMask: [.borderless],
                                    backing: .buffered,
@@ -87,6 +115,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 唤起:清空上次搜索与高亮、置顶显示、聚焦搜索框。
     func showOverlay() {
         guard let window else { return }
+        let targetFrame = selectedScreen().frame
+        if window.frame != targetFrame { window.setFrame(targetFrame, display: false) }
         AppState.shared.query = ""
         AppState.shared.highlightedAppID = nil
         AppState.shared.openFolderID = nil
@@ -105,10 +135,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.hide(nil)
     }
 
-    /// 菜单栏入口:唤起并打开设置面板。
+    /// 菜单栏入口:打开独立设置窗口。
     @objc private func openSettings() {
-        showOverlay()
-        AppState.shared.showSettings = true
+        showSettingsWindow()
+    }
+
+    func showSettingsWindow() {
+        dismissOverlay()
+        if let settingsWindow, settingsWindow.isVisible {
+            settingsWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 650),
+                             styleMask: [.titled, .closable, .miniaturizable],
+                             backing: .buffered,
+                             defer: false)
+        panel.title = "LaunchpadClone 设置"
+        panel.isReleasedWhenClosed = false
+        panel.isRestorable = false
+        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.center()
+        panel.contentView = NSHostingView(rootView: SettingsPanel())
+        settingsWindow = panel
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     /// 松开鼠标 = 一次按住结束,解除"拖拽已取消"的抑制。
@@ -122,7 +174,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 重复执行唤起动作 = 关闭(与 LaunchOS 行为一致)。
     /// 弹窗(重命名等)打开期间不响应:隐藏再唤起会破坏 sheet 的键盘焦点(假模态)。
     @objc func toggleOverlay() {
-        guard window?.attachedSheet == nil else { return }
+        guard window?.attachedSheet == nil,
+              settingsWindow?.isVisible != true else { return }
         if window?.isVisible == true {
             dismissOverlay()
         } else {
@@ -133,6 +186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 菜单栏图标
 
     private func setUpStatusItem() {
+        guard Settings.showMenuBarIcon, statusItem == nil else { return }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
             button.image = NSImage(systemSymbolName: "square.grid.3x3.fill",
@@ -142,6 +196,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         statusItem = item
+    }
+
+    /// 设置修改菜单栏图标可见性后立即更新状态栏项目。
+    func menuBarVisibilityChanged() {
+        if Settings.showMenuBarIcon {
+            setUpStatusItem()
+        } else if let statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+            self.statusItem = nil
+        }
     }
 
     /// 左键:唤起/关闭;右键:菜单(退出等)。
@@ -193,6 +257,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hotKeyID = EventHotKeyID(signature: OSType(0x4C50_434C), id: 1) // "LPCL"
         RegisterEventHotKey(option.keyCode, option.modifiers,
                             hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+        if let existing = f4HotKeyRef {
+            UnregisterEventHotKey(existing)
+            f4HotKeyRef = nil
+        }
+        if Settings.enableF4Shortcut {
+            let f4ID = EventHotKeyID(signature: OSType(0x4C50_4634), id: 2)
+            RegisterEventHotKey(UInt32(kVK_F4), 0, f4ID,
+                                GetApplicationEventTarget(), 0, &f4HotKeyRef)
+        }
     }
 
     /// 设置面板切换了快捷键组合:重新注册。
@@ -200,10 +273,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerHotKey()
     }
 
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                if #available(macOS 13.0, *) { try SMAppService.mainApp.register() }
+            } else {
+                if #available(macOS 13.0, *) { try SMAppService.mainApp.unregister() }
+            }
+        } catch {
+            Settings.launchAtLogin = false
+        }
+    }
+
     // MARK: - 键盘
 
     private func setUpKeyMonitor() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            // 设置窗口是独立原生窗口，不让启动台的全局监听器拦截其控件输入。
+            if self?.settingsWindow?.isKeyWindow == true { return event }
             // 输入法组字期间(拼音候选窗弹出)把所有按键让给输入法:
             // 方向键选候选字、回车上屏、Esc 取消组字都必须由 IME 处理
             if let editor = self?.window?.firstResponder as? NSTextView,
@@ -234,7 +321,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             // ⌘, 打开设置(通用快捷键)
             if event.keyCode == 43, event.modifierFlags.contains(.command) {
-                AppState.shared.showSettings = true
+                self?.showSettingsWindow()
                 return nil
             }
             // 文件夹展开时的键盘策略(先于 ⌘翻页,保证面板下网格不动):
@@ -282,6 +369,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return event
         }
+    }
+
+    private func selectedScreen() -> NSScreen {
+        let fallback = NSScreen.main ?? NSScreen.screens.first!
+        switch Settings.displayStrategy {
+        case .main:
+            return NSScreen.main ?? fallback
+        case .active:
+            return NSApp.keyWindow?.screen ?? NSScreen.main ?? fallback
+        case .mouse:
+            let point = NSEvent.mouseLocation
+            return NSScreen.screens.first(where: { $0.frame.contains(point) })
+                ?? NSScreen.main ?? fallback
+        }
+    }
+
+    @objc private func screenParametersChanged(_ notification: Notification) {
+        guard let window else { return }
+        let frame = selectedScreen().frame
+        if window.frame != frame {
+            window.setFrame(frame, display: window.isVisible)
+        }
+    }
+
+    // MARK: - 热角
+
+    private func setUpHotCornerMonitor() {
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.activateHotCornerIfNeeded()
+            }
+        }
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: .mouseMoved) { [weak self] event in
+            self?.activateHotCornerIfNeeded()
+            return event
+        }
+    }
+
+    private func activateHotCornerIfNeeded() {
+        let corner = Settings.hotCorner
+        guard corner != .disabled, window?.isVisible != true else { return }
+
+        let point = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(point) }) else { return }
+        let frame = screen.frame
+        let threshold: CGFloat = 3
+        let isInCorner: Bool
+        switch corner {
+        case .disabled:
+            isInCorner = false
+        case .topLeft:
+            isInCorner = point.x <= frame.minX + threshold && point.y >= frame.maxY - threshold
+        case .topRight:
+            isInCorner = point.x >= frame.maxX - threshold && point.y >= frame.maxY - threshold
+        case .bottomLeft:
+            isInCorner = point.x <= frame.minX + threshold && point.y <= frame.minY + threshold
+        case .bottomRight:
+            isInCorner = point.x >= frame.maxX - threshold && point.y <= frame.minY + threshold
+        }
+
+        if !isInCorner {
+            hotCornerArmed = true
+            return
+        }
+        guard hotCornerArmed else { return }
+        hotCornerArmed = false
+        showOverlay()
     }
 
     /// 方向键移动高亮:分页模式跨页时同步翻页;搜索模式在结果网格中移动。
