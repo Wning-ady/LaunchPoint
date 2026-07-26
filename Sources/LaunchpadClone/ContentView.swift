@@ -1,12 +1,6 @@
 import SwiftUI
 import AppKit
 
-/// 网格槽位标识:第 page 页第 slot 格。
-struct SlotKey: Hashable {
-    let page: Int
-    let slot: Int
-}
-
 /// 收集单元格尺寸(只取高度用于行距推算;水平几何用纯数学,不依赖测量)。
 struct CellSizeKey: PreferenceKey {
     static var defaultValue: CGSize = .zero
@@ -30,14 +24,34 @@ struct ContentView: View {
     private static let gridTop: CGFloat = 20
     private static let edgeMargin: CGFloat = 48
 
+    /// 拖拽落点:插到槽位之间,或落到某条目上(建夹/入夹)。
+    enum DropTarget: Equatable {
+        case insert(page: Int, slot: Int)
+        case onto(page: Int, entryID: String)
+    }
+
+    /// 起拖时指针所在的格子(页 + 格序),用于"拿起放回"保护。
+    private struct OriginCell: Equatable {
+        let page: Int
+        let cell: Int
+    }
+
     // MARK: 拖拽排序状态
     @State private var draggingApp: AppItem?
     @State private var dragLocation: CGPoint = .zero       // "pagingArea" 坐标
-    @State private var previewPages: [[AppItem]]?          // 拖拽中的预览布局
-    @State private var previewTarget: SlotKey?
+    @State private var previewPages: [[PageEntry]]?        // 拖拽中的预览布局
+    @State private var dropTarget: DropTarget?
+    @State private var dragOrigin: OriginCell?             // 起拖格
+    @State private var hasLeftOrigin = false               // 指针是否已离开起拖格
     @State private var containerWidth: CGFloat = 0         // 分页容器宽度(即页宽)
     @State private var cellHeight: CGFloat = 120           // 单元格高度(测量,供行距推算)
     @State private var edgeFlipWork: DispatchWorkItem?
+
+    /// onto 模式下被悬停的条目(视觉放大提示)。
+    private var ontoHighlightID: String? {
+        if case .onto(_, let id) = dropTarget { return id }
+        return nil
+    }
 
     /// 分页与搜索结果共用固定列数:键盘导航需要确定的网格几何。
     private var gridColumns: [GridItem] {
@@ -46,7 +60,7 @@ struct ContentView: View {
     }
 
     /// 展示用页面:拖拽时用预览布局,并在末尾提供一个空承接页。
-    private var displayPages: [[AppItem]] {
+    private var displayPages: [[PageEntry]] {
         if let previewPages { return previewPages }
         var pages = store.pages
         if draggingApp != nil { pages.append([]) }
@@ -59,6 +73,19 @@ struct ContentView: View {
     }
 
     var body: some View {
+        ZStack {
+            mainContent
+
+            // 文件夹展开面板(盖在网格之上)
+            if let folderID = state.openFolderID {
+                folderOverlay(folderID)
+                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+            }
+        }
+        .animation(.spring(response: 0.3, dampingFraction: 0.85), value: state.openFolderID)
+    }
+
+    private var mainContent: some View {
         VStack(spacing: 16) {
             searchField
 
@@ -94,6 +121,10 @@ struct ContentView: View {
         // 页数变化时防止停留在已不存在的页
         .onChange(of: store.pages.count) { _, count in
             state.currentPage = min(state.currentPage, max(0, count - 1))
+        }
+        // 关闭文件夹后把焦点还给搜索框(改名可能夺走过焦点)
+        .onChange(of: state.openFolderID) { _, id in
+            if id == nil { focusSearch() }
         }
         .onChange(of: state.query) { old, new in
             // 拖拽中打字会切走分页视图、销毁手势:先取消拖拽防状态泄漏
@@ -143,7 +174,7 @@ struct ContentView: View {
             ZStack(alignment: .topLeading) {
                 HStack(spacing: 0) {
                     ForEach(displayPages.indices, id: \.self) { pageIndex in
-                        pageView(displayPages[pageIndex], pageIndex: pageIndex)
+                        pageView(displayPages[pageIndex])
                             .frame(width: width, height: geo.size.height, alignment: .top)
                     }
                 }
@@ -186,22 +217,155 @@ struct ContentView: View {
             }
     }
 
-    private func pageView(_ apps: [AppItem], pageIndex: Int) -> some View {
+    private func pageView(_ entries: [PageEntry]) -> some View {
         LazyVGrid(columns: gridColumns, spacing: Self.rowSpacing) {
-            ForEach(apps) { app in
-                appCell(app)
-                    // 拖拽中的应用在预览槽位处半透明显示,作为落点指示
-                    .opacity(app.id == draggingApp?.id ? 0.35 : 1)
+            ForEach(entries) { entry in
+                entryCell(entry)
+                    // onto 悬停:目标条目放大提示"松手即建夹/入夹"
+                    .scaleEffect(ontoHighlightID == entry.id ? 1.12 : 1)
+                    .animation(.spring(response: 0.25, dampingFraction: 0.7),
+                               value: ontoHighlightID == entry.id)
                     .background(
                         GeometryReader { g in
                             Color.clear.preference(key: CellSizeKey.self, value: g.size)
                         }
                     )
-                    .gesture(iconDragGesture(app))
             }
         }
         .padding(.horizontal, Self.hPadding)
         .padding(.top, Self.gridTop)
+    }
+
+    @ViewBuilder
+    private func entryCell(_ entry: PageEntry) -> some View {
+        switch entry {
+        case .app(let app):
+            appCell(app)
+                // 拖拽中的应用在预览槽位处半透明显示,作为落点指示
+                .opacity(app.id == draggingApp?.id ? 0.35 : 1)
+                .gesture(iconDragGesture(app))
+        case .folder(let info):
+            folderCell(info)
+        }
+    }
+
+    // MARK: - 文件夹
+
+    /// 文件夹图块:托盘 + 2×2 成员预览 + 名称。
+    private func folderCell(_ info: FolderInfo) -> some View {
+        VStack(spacing: 8) {
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
+                                GridItem(.flexible(), spacing: 6)], spacing: 6) {
+                ForEach(0..<4, id: \.self) { i in
+                    if i < info.preview.count {
+                        Image(nsImage: info.preview[i].icon)
+                            .resizable()
+                            .interpolation(.high)
+                            .frame(width: 24, height: 24)
+                            .clipShape(RoundedRectangle(cornerRadius: 5))
+                    } else {
+                        Color.clear.frame(width: 24, height: 24)
+                    }
+                }
+            }
+            .padding(8)
+            .frame(width: 72, height: 72)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+            Text(info.name.isEmpty ? "未命名文件夹" : info.name)
+                .font(.system(size: 12))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: 100)
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color.primary.opacity(info.id == state.highlightedAppID ? 0.14 : 0))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { state.openFolderID = info.id }
+    }
+
+    /// 文件夹展开面板:标题可点击改名,成员网格,点外部/Esc 关闭,可解散。
+    private func folderOverlay(_ folderID: String) -> some View {
+        ZStack {
+            Color.black.opacity(0.35)
+                .contentShape(Rectangle())
+                .onTapGesture { state.openFolderID = nil }   // 点击外部空白关闭
+
+            VStack(spacing: 14) {
+                FolderTitleField(folderID: folderID)
+
+                // 成员多时可滚动,保证标题与解散按钮始终可达
+                ScrollView {
+                    let members = store.folderItems(folderID)
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 16),
+                                             count: min(5, max(members.count, 1))),
+                              spacing: 22) {
+                        ForEach(members) { app in
+                            appCell(app)
+                        }
+                    }
+                    .padding(.horizontal, 34)
+                    .padding(.vertical, 6)
+                }
+                .frame(maxHeight: 520)
+                .fixedSize(horizontal: false, vertical: true)
+
+                Button("解散文件夹") {
+                    store.dissolveFolder(folderID)
+                    state.openFolderID = nil
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 20)
+            }
+            .padding(.top, 8)
+            .frame(maxWidth: 720)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 26))
+            .shadow(color: .black.opacity(0.3), radius: 30, y: 10)
+        }
+    }
+
+    /// 文件夹标题:点击即改名(还原 LaunchOS:点展开后的标题重命名)。
+    /// 回车或面板关闭(点外部/Esc)都会提交,不丢输入。
+    private struct FolderTitleField: View {
+        let folderID: String
+        @State private var name: String = ""
+        @State private var original: String = ""
+        @FocusState private var editing: Bool
+
+        var body: some View {
+            TextField("未命名文件夹", text: $name)
+                .textFieldStyle(.plain)
+                .multilineTextAlignment(.center)
+                .font(.system(size: 18, weight: .medium))
+                .focused($editing)
+                .frame(maxWidth: 300)
+                .padding(.top, 22)
+                .onAppear {
+                    name = LayoutStore.shared.folderName(folderID)
+                    original = name
+                }
+                // 改名中把按键让给输入框(全局按键监听据此放行)
+                .onChange(of: editing) { _, isEditing in
+                    AppState.shared.folderTitleEditing = isEditing
+                }
+                .onSubmit { commit() }
+                .onDisappear {
+                    commit()
+                    AppState.shared.folderTitleEditing = false
+                }
+        }
+
+        private func commit() {
+            guard name != original else { return }
+            LayoutStore.shared.renameFolder(folderID, to: name)
+            original = name
+        }
     }
 
     // MARK: - 图标拖拽排序
@@ -209,7 +373,8 @@ struct ContentView: View {
     private func iconDragGesture(_ app: AppItem) -> some Gesture {
         DragGesture(minimumDistance: 6, coordinateSpace: .named("pagingArea"))
             .onChanged { value in
-                guard state.effectiveQuery.isEmpty else { return }   // 搜索态不排序
+                guard state.effectiveQuery.isEmpty,
+                      state.openFolderID == nil else { return }   // 搜索态/文件夹展开不排序
                 dragChanged(app, value)
             }
             .onEnded { _ in
@@ -222,14 +387,46 @@ struct ContentView: View {
         if draggingApp == nil {
             draggingApp = app
             AppState.shared.isDragging = true
+            hasLeftOrigin = false
+            // 记录起拖格:指针未离开它之前不判定任何落点("拿起放回"必须是无操作)
+            let xInPage = value.location.x   // 起拖时必然在当前可见页
+            if let cell = cellIndex(xInPage: xInPage, y: value.location.y) {
+                dragOrigin = OriginCell(page: state.currentPage, cell: cell)
+            } else {
+                dragOrigin = nil
+            }
         }
         dragLocation = value.location
         evaluateDragTarget()
         handleEdgeHover()
     }
 
-    /// 由指针位置(pagingArea 坐标)+ 当前页码推算落点并刷新预览。
-    /// 纯数学推导,不依赖运行时测量的水平几何,翻页动画/空页都不影响正确性。
+    /// 指针所在格序(不带中心区约束);出界返回 nil。
+    private func cellIndex(xInPage: CGFloat, y: CGFloat) -> Int? {
+        let cols = LayoutStore.columns
+        let colWidth = (containerWidth - 2 * Self.hPadding
+                        - CGFloat(cols - 1) * Self.colSpacing) / CGFloat(cols)
+        let pitch = colWidth + Self.colSpacing
+        let col = Int(floor((xInPage - Self.hPadding) / pitch))
+        guard col >= 0, col < cols else { return nil }
+        let rowPitch = cellHeight + Self.rowSpacing
+        let row = Int(floor((y - Self.gridTop) / rowPitch))
+        guard row >= 0, row < LayoutStore.rows else { return nil }
+        return row * cols + col
+    }
+
+    /// 移除被拖应用后的基准布局(末尾带承接空页)。
+    private func basePagesWithoutDragged(_ app: AppItem) -> [[PageEntry]] {
+        var base = store.pages
+        base.append([])
+        for i in base.indices {
+            base[i].removeAll { $0.id == app.id }
+        }
+        return base
+    }
+
+    /// 由指针位置 + 当前页码推算落点(插入 / 建夹 / 入夹)并刷新预览。
+    /// 纯数学推导,不依赖运行时测量的水平几何。
     private func evaluateDragTarget() {
         guard let app = draggingApp, containerWidth > 0 else { return }
         let width = containerWidth
@@ -237,15 +434,54 @@ struct ContentView: View {
         var pageIndex = Int(floor(contentX / width))
         pageIndex = min(max(pageIndex, 0), store.pages.count)   // 末尾允许承接新页
         let xInPage = contentX - CGFloat(pageIndex) * width
-        let slot = insertionSlot(xInPage: xInPage, y: dragLocation.y)
-        let target = SlotKey(page: pageIndex, slot: slot)
-        if target != previewTarget {
-            updatePreview(app: app, target: target)
+
+        // "拿起放回"保护:指针未离开起拖格之前不判定落点,松手即无操作
+        if !hasLeftOrigin {
+            let current = cellIndex(xInPage: xInPage, y: dragLocation.y)
+                .map { OriginCell(page: pageIndex, cell: $0) }
+            if let origin = dragOrigin, current == origin {
+                return
+            }
+            hasLeftOrigin = true
         }
+
+        let base = basePagesWithoutDragged(app)
+
+        // 悬停在某条目中心区 → 建夹(应用)或入夹(文件夹)
+        if pageIndex < base.count,
+           let hit = ontoHit(xInPage: xInPage, y: dragLocation.y, entries: base[pageIndex]) {
+            setDropTarget(.onto(page: pageIndex, entryID: hit.id), app: app, base: base)
+            return
+        }
+
+        let slot = insertionSlot(xInPage: xInPage, y: dragLocation.y)
+        setDropTarget(.insert(page: pageIndex, slot: slot), app: app, base: base)
     }
 
-    /// 网格插入槽位:列宽由容器宽度与固定边距推出;行距由测得的单元格高度推出。
-    /// 指针越过某格中心 → 插到其后。
+    /// 指针是否悬停在条目的中心区(横向中央 56%、纵向中央 76%)。
+    private func ontoHit(xInPage: CGFloat, y: CGFloat, entries: [PageEntry]) -> PageEntry? {
+        let cols = LayoutStore.columns
+        let colWidth = (containerWidth - 2 * Self.hPadding
+                        - CGFloat(cols - 1) * Self.colSpacing) / CGFloat(cols)
+        let pitch = colWidth + Self.colSpacing
+        let xInGrid = xInPage - Self.hPadding
+        let col = Int(floor(xInGrid / pitch))
+        guard col >= 0, col < cols else { return nil }
+        let fracX = xInGrid - CGFloat(col) * pitch
+        guard fracX > colWidth * 0.22, fracX < colWidth * 0.78 else { return nil }
+
+        let rowPitch = cellHeight + Self.rowSpacing
+        let yInGrid = y - Self.gridTop
+        let row = Int(floor(yInGrid / rowPitch))
+        guard row >= 0, row < LayoutStore.rows else { return nil }
+        let fracY = yInGrid - CGFloat(row) * rowPitch
+        guard fracY > cellHeight * 0.12, fracY < cellHeight * 0.88 else { return nil }
+
+        let index = row * cols + col
+        return index < entries.count ? entries[index] : nil
+    }
+
+    /// 网格插入槽位:指针越过某格中心 → 插到其后。
     private func insertionSlot(xInPage: CGFloat, y: CGFloat) -> Int {
         let cols = LayoutStore.columns
         let colWidth = (containerWidth - 2 * Self.hPadding
@@ -253,7 +489,6 @@ struct ContentView: View {
         let pitch = colWidth + Self.colSpacing
 
         let xInGrid = xInPage - Self.hPadding
-        // 已越过多少个格心 = 行内插入位
         var col = Int(floor((xInGrid - colWidth / 2) / pitch)) + 1
         col = min(max(col, 0), cols)
 
@@ -264,29 +499,28 @@ struct ContentView: View {
         return row * cols + col
     }
 
-    /// 生成预览布局:被拖应用移除后插入目标槽位;超容的页向后级联溢出(与落盘规则一致)。
-    private func updatePreview(app: AppItem, target: SlotKey) {
-        var base = store.pages
-        base.append([])   // 承接新页
-        for i in base.indices {
-            base[i].removeAll { $0.id == app.id }
-        }
-        let p = min(target.page, base.count - 1)
-        let s = min(max(target.slot, 0), base[p].count)
-        base[p].insert(app, at: s)
+    /// 更新落点与预览。insert → 实时让位;onto → 收拢空位、目标放大。
+    private func setDropTarget(_ target: DropTarget, app: AppItem, base: [[PageEntry]]) {
+        guard target != dropTarget else { return }
+        dropTarget = target
 
-        // 级联溢出:插入导致超容的页,把队尾挤到下一页开头(与 normalizeCapacity 行为一致)
-        var i = p
-        while base[i].count > LayoutStore.capacity {
-            let spilled = base[i].removeLast()
-            if i + 1 >= base.count { base.append([]) }
-            base[i + 1].insert(spilled, at: 0)
-            i += 1
-        }
+        var preview = base
+        if case .insert(let page, let slot) = target {
+            let p = min(page, preview.count - 1)
+            let s = min(max(slot, 0), preview[p].count)
+            preview[p].insert(.app(app), at: s)
 
-        previewTarget = SlotKey(page: p, slot: s)
+            // 级联溢出:插入导致超容的页,把队尾挤到下一页开头(与落盘规则一致)
+            var i = p
+            while preview[i].count > LayoutStore.capacity {
+                let spilled = preview[i].removeLast()
+                if i + 1 >= preview.count { preview.append([]) }
+                preview[i + 1].insert(spilled, at: 0)
+                i += 1
+            }
+        }
         withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-            previewPages = base
+            previewPages = preview
         }
     }
 
@@ -324,8 +558,17 @@ struct ContentView: View {
 
     private func commitDrag() {
         AppState.shared.dragInhibited = false    // 一次按住结束
-        if let app = draggingApp, let target = previewTarget {
-            store.moveApp(app.id, toPage: target.page, slot: target.slot)
+        if let app = draggingApp, let target = dropTarget {
+            switch target {
+            case .insert(let page, let slot):
+                store.moveApp(app.id, toPage: page, slot: slot)
+            case .onto(_, let entryID):
+                if store.isFolderID(entryID) {
+                    store.addToFolder(app.id, folderID: entryID)
+                } else if entryID != app.id {
+                    store.createFolder(dragging: app.id, onto: entryID, name: "未命名文件夹")
+                }
+            }
         }
         finishDrag()
     }
@@ -335,7 +578,9 @@ struct ContentView: View {
         edgeFlipWork?.cancel()
         edgeFlipWork = nil
         draggingApp = nil
-        previewTarget = nil
+        dropTarget = nil
+        dragOrigin = nil
+        hasLeftOrigin = false
         AppState.shared.isDragging = false
         state.currentPage = min(state.currentPage, max(0, store.pages.count - 1))
         withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
