@@ -79,9 +79,9 @@ enum PageEntry: Identifiable {
 final class LayoutStore: ObservableObject {
     static let shared = LayoutStore()
 
-    /// 网格容量(后续做成设置项,参照 LaunchOS 的 columns/rows)。
-    static let columns = 7
-    static let rows = 5
+    /// 网格容量(设置面板可调;启动时由 Settings 注入,避免此处依赖设置层)。
+    static var columns = 7
+    static var rows = 5
     static var capacity: Int { columns * rows }
 
     /// 展示用扁平应用列表(搜索用,含文件夹内应用)。
@@ -269,6 +269,43 @@ final class LayoutStore: ObservableObject {
                 item.alias = record.alias
                 return item
             }
+    }
+
+    /// 网格行列数变化后重排(超容溢出、重建展示、落盘)。
+    func gridConfigChanged() {
+        commitMutation()
+    }
+
+    /// 按显示名重排所有页面级条目(应用+文件夹图块),从第一页起连续排列,
+    /// 超容由容量归一自动分页。文件夹内部顺序不动。
+    func arrangeAllByName() {
+        let pageGroups = layout.groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
+        guard let firstPage = pageGroups.first else { return }
+
+        var entities = pageGroups.flatMap {
+            Self.entityList(apps: layout.apps, groups: layout.groups,
+                            pageID: $0.id, page: $0.page)
+        }
+
+        func displayName(_ entity: LayoutEntity) -> String {
+            switch entity.ref {
+            case .app(let id):
+                guard let record = layout.apps.first(where: { $0.id == id }) else { return "" }
+                if let alias = record.alias, !alias.isEmpty { return alias }
+                return record.name
+            case .folder(let id):
+                return layout.groups.first { $0.id == id }?.name ?? ""
+            }
+        }
+
+        entities.sort {
+            displayName($0).localizedCaseInsensitiveCompare(displayName($1)) == .orderedAscending
+        }
+        // 全部排入第一页,交给容量归一按页瀑布式切分
+        for (order, entity) in entities.enumerated() {
+            assign(entity, pageID: firstPage.id, page: firstPage.page, order: order)
+        }
+        commitMutation()
     }
 
     // MARK: - 变更收尾
