@@ -4,12 +4,12 @@ import Foundation
 enum KeyboardNav {
     enum Direction { case left, right, up, down }
 
-    /// 分页模式移动。返回新高亮应用与其所在页;nil 表示保持不动。
+    /// 分页模式移动(条目 = 应用或文件夹图块)。返回新高亮条目与其所在页;nil 表示保持不动。
     /// 约定(还原原生启动台):
-    /// - 尚无高亮时,从当前页第一个应用开始
+    /// - 尚无高亮时,从当前页第一个条目开始
     /// - 左/右在页首/页尾时自动跨到相邻非空页(高亮所在页同步切换)
     /// - 上/下只在本页内移动,越界不动
-    static func move(pages: [[AppItem]], columns: Int,
+    static func move(pages: [[PageEntry]], columns: Int,
                      currentID: String?, currentPage: Int,
                      direction: Direction) -> (id: String, page: Int)? {
         guard pages.contains(where: { !$0.isEmpty }) else { return nil }
@@ -68,7 +68,7 @@ enum KeyboardNav {
         }
     }
 
-    private static func locate(_ id: String, in pages: [[AppItem]]) -> (Int, Int)? {
+    private static func locate(_ id: String, in pages: [[PageEntry]]) -> (Int, Int)? {
         for (p, page) in pages.enumerated() {
             if let i = page.firstIndex(where: { $0.id == id }) { return (p, i) }
         }

@@ -16,6 +16,10 @@ final class AppState: ObservableObject {
     @Published var isDragging = false
     /// 拖拽已被取消(Esc/隐藏/切搜索),同一次按住期间不得重新开始拖拽;松开鼠标后复位。
     var dragInhibited = false
+    /// 当前展开的文件夹 id;nil = 未展开。
+    @Published var openFolderID: String?
+    /// 是否正在编辑文件夹标题(改名中):此时按键全部放行给输入框。
+    var folderTitleEditing = false
 
     func flipPage(_ delta: Int) {
         var count = LayoutStore.shared.pages.count
@@ -80,6 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let window else { return }
         AppState.shared.query = ""
         AppState.shared.highlightedAppID = nil
+        AppState.shared.openFolderID = nil
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         NotificationCenter.default.post(name: .refocusSearch, object: nil)
@@ -174,14 +179,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                editor.hasMarkedText() {
                 return event
             }
-            // Esc:拖拽中先终止拖拽;搜索非空时清空搜索;否则关闭(还原 LaunchOS 行为)。
+            // Esc 层级:终止拖拽 > 关闭文件夹 > 清空搜索 > 关闭覆盖层(还原 LaunchOS 行为)。
             if event.keyCode == 53 { // Esc
                 if AppState.shared.isDragging {
                     NotificationCenter.default.post(name: .cancelDrag, object: nil)
+                } else if AppState.shared.openFolderID != nil {
+                    AppState.shared.openFolderID = nil
                 } else if AppState.shared.query.isEmpty {
                     self?.dismissOverlay()
                 } else {
                     AppState.shared.query = ""
+                }
+                return nil
+            }
+            // 拖拽中吞掉导航键:防止拖拽时回车开夹/启动应用造成状态交叠
+            if AppState.shared.isDragging,
+               [36, 76, 123, 124, 125, 126].contains(Int(event.keyCode)) {
+                return nil
+            }
+            // 文件夹展开时的键盘策略(先于 ⌘翻页,保证面板下网格不动):
+            // - 改名中:全部放行给标题输入框
+            // - 方向键/回车/⌘组合:吞掉,防背景网格翻页误动
+            // - 可打印字符:关闭文件夹并进入搜索(还原原生"打字即搜")
+            if AppState.shared.openFolderID != nil {
+                if AppState.shared.folderTitleEditing { return event }
+                if [36, 76, 123, 124, 125, 126].contains(Int(event.keyCode))
+                    || event.modifierFlags.contains(.command) {
+                    return nil
+                }
+                if let chars = event.characters, !chars.isEmpty {
+                    AppState.shared.openFolderID = nil
+                    return event
                 }
                 return nil
             }
@@ -198,14 +226,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.moveHighlight(direction)
                 return nil
             }
-            // 回车(主键盘 36 / 小键盘 76):打开高亮应用;
+            // 回车(主键盘 36 / 小键盘 76):打开高亮的应用或文件夹;
             // 无高亮时放行给搜索框 onSubmit(打开第一个结果)
             if event.keyCode == 36 || event.keyCode == 76,
-               let id = AppState.shared.highlightedAppID,
-               let app = LayoutStore.shared.items.first(where: { $0.id == id }) {
-                NSWorkspace.shared.open(app.url)
-                self?.dismissOverlay()
-                return nil
+               let id = AppState.shared.highlightedAppID {
+                if LayoutStore.shared.isFolderID(id) {
+                    AppState.shared.openFolderID = id
+                    return nil
+                }
+                if let app = LayoutStore.shared.items.first(where: { $0.id == id }) {
+                    NSWorkspace.shared.open(app.url)
+                    self?.dismissOverlay()
+                    return nil
+                }
             }
             return event
         }
@@ -244,6 +277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
             guard let self,
                   self.window?.isVisible == true,
+                  AppState.shared.openFolderID == nil,          // 文件夹展开时不翻页
                   AppState.shared.effectiveQuery.isEmpty else { return event } // 搜索结果照常滚动
 
             let dx = event.scrollingDeltaX
