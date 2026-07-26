@@ -63,6 +63,12 @@ struct ContentView: View {
                 searchFocused = true
             }
         }
+        // 每次从菜单栏/快捷键重新唤起时,重新聚焦搜索框
+        .onReceive(NotificationCenter.default.publisher(for: .refocusSearch)) { _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                searchFocused = true
+            }
+        }
     }
 
     private func launch(_ app: AppItem) {
