@@ -10,11 +10,15 @@ final class AppState: ObservableObject {
     var effectiveQuery: String { query.trimmingCharacters(in: .whitespaces) }
     /// 当前页码。隐藏后不重置——还原"上次打开的位置"(原生默认行为)。
     @Published var currentPage = 0
+    /// 键盘高亮的应用(id = 应用路径);nil = 无高亮。
+    @Published var highlightedAppID: String?
 
     func flipPage(_ delta: Int) {
         let count = LayoutStore.shared.pages.count
         guard count > 0 else { return }
         currentPage = min(max(currentPage + delta, 0), count - 1)
+        // 手动翻页后旧页高亮失效:防止方向键把视图拽回旧页、回车启动看不见的应用
+        highlightedAppID = nil
     }
 }
 
@@ -63,10 +67,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.window = window
     }
 
-    /// 唤起:清空上次搜索、置顶显示、聚焦搜索框。
+    /// 唤起:清空上次搜索与高亮、置顶显示、聚焦搜索框。
     func showOverlay() {
         guard let window else { return }
         AppState.shared.query = ""
+        AppState.shared.highlightedAppID = nil
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         NotificationCenter.default.post(name: .refocusSearch, object: nil)
@@ -143,6 +148,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setUpKeyMonitor() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            // 输入法组字期间(拼音候选窗弹出)把所有按键让给输入法:
+            // 方向键选候选字、回车上屏、Esc 取消组字都必须由 IME 处理
+            if let editor = self?.window?.firstResponder as? NSTextView,
+               editor.hasMarkedText() {
+                return event
+            }
             // Esc:搜索非空时先清空搜索,否则关闭(还原 LaunchOS 行为)。
             if event.keyCode == 53 { // Esc
                 if AppState.shared.query.isEmpty {
@@ -157,7 +168,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if event.keyCode == 123 { AppState.shared.flipPage(-1); return nil } // ←
                 if event.keyCode == 124 { AppState.shared.flipPage(1); return nil }  // →
             }
+            // 方向键:无修饰键时移动高亮(与原生一致,优先于搜索框文本光标);
+            // ⇧/⌥/⌃ 修饰的方向键放行给文本框(选择文本、按词移动)
+            let arrows: [UInt16: KeyboardNav.Direction] = [123: .left, 124: .right, 125: .down, 126: .up]
+            if let direction = arrows[event.keyCode],
+               event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty {
+                self?.moveHighlight(direction)
+                return nil
+            }
+            // 回车(主键盘 36 / 小键盘 76):打开高亮应用;
+            // 无高亮时放行给搜索框 onSubmit(打开第一个结果)
+            if event.keyCode == 36 || event.keyCode == 76,
+               let id = AppState.shared.highlightedAppID,
+               let app = LayoutStore.shared.items.first(where: { $0.id == id }) {
+                NSWorkspace.shared.open(app.url)
+                self?.dismissOverlay()
+                return nil
+            }
             return event
+        }
+    }
+
+    /// 方向键移动高亮:分页模式跨页时同步翻页;搜索模式在结果网格中移动。
+    private func moveHighlight(_ direction: KeyboardNav.Direction) {
+        let state = AppState.shared
+        if state.effectiveQuery.isEmpty {
+            if let result = KeyboardNav.move(pages: LayoutStore.shared.pages,
+                                             columns: LayoutStore.columns,
+                                             currentID: state.highlightedAppID,
+                                             currentPage: state.currentPage,
+                                             direction: direction) {
+                state.highlightedAppID = result.id
+                state.currentPage = result.page   // 高亮跨页时同步切页
+            }
+        } else {
+            let results = SearchEngine.rank(state.effectiveQuery, in: LayoutStore.shared.items)
+            if let id = KeyboardNav.move(items: results,
+                                         columns: LayoutStore.columns,
+                                         currentID: state.highlightedAppID,
+                                         direction: direction) {
+                state.highlightedAppID = id
+            }
         }
     }
 
