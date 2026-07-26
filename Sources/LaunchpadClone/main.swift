@@ -6,6 +6,8 @@ import Carbon.HIToolbox
 final class AppState: ObservableObject {
     static let shared = AppState()
     @Published var query = ""
+    /// 去除首尾空白后的有效查询:误触空格不应切换搜索态或参与匹配。
+    var effectiveQuery: String { query.trimmingCharacters(in: .whitespaces) }
     /// 当前页码。隐藏后不重置——还原"上次打开的位置"(原生默认行为)。
     @Published var currentPage = 0
 
@@ -151,7 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return nil
             }
             // ⌘← / ⌘→ 翻页(还原原生启动台快捷键)
-            if event.modifierFlags.contains(.command), AppState.shared.query.isEmpty {
+            if event.modifierFlags.contains(.command), AppState.shared.effectiveQuery.isEmpty {
                 if event.keyCode == 123 { AppState.shared.flipPage(-1); return nil } // ←
                 if event.keyCode == 124 { AppState.shared.flipPage(1); return nil }  // →
             }
@@ -169,7 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
             guard let self,
                   self.window?.isVisible == true,
-                  AppState.shared.query.isEmpty else { return event } // 搜索结果照常滚动
+                  AppState.shared.effectiveQuery.isEmpty else { return event } // 搜索结果照常滚动
 
             let dx = event.scrollingDeltaX
             let dy = event.scrollingDeltaY
