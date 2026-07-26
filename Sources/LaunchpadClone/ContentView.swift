@@ -4,14 +4,18 @@ import AppKit
 struct ContentView: View {
     let dismiss: () -> Void
     @ObservedObject private var state = AppState.shared
-    @State private var apps: [AppItem] = []
+    @ObservedObject private var store = LayoutStore.shared
     @FocusState private var searchFocused: Bool
 
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 28)]
 
     private var filtered: [AppItem] {
-        guard !state.query.isEmpty else { return apps }
-        return apps.filter { $0.name.localizedCaseInsensitiveContains(state.query) }
+        guard !state.query.isEmpty else { return store.items }
+        // 按显示名(别名优先)和默认名双路匹配
+        return store.items.filter {
+            $0.displayName.localizedCaseInsensitiveContains(state.query)
+                || $0.name.localizedCaseInsensitiveContains(state.query)
+        }
     }
 
     var body: some View {
@@ -37,7 +41,7 @@ struct ContentView: View {
                                     .resizable()
                                     .interpolation(.high)
                                     .frame(width: 72, height: 72)
-                                Text(app.name)
+                                Text(app.displayName)
                                     .font(.system(size: 12))
                                     .foregroundStyle(.primary)
                                     .lineLimit(1)
@@ -57,14 +61,15 @@ struct ContentView: View {
         .contentShape(Rectangle())
         .onTapGesture { dismiss() }   // 点击空白区域关闭(图标与搜索框会自行消费点击)
         .onAppear {
-            apps = AppScanner.scan()
+            store.refresh()
             // 显示后自动聚焦搜索框:无需点击,输入即搜
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 searchFocused = true
             }
         }
-        // 每次从菜单栏/快捷键重新唤起时,重新聚焦搜索框
+        // 每次从菜单栏/快捷键重新唤起时:重新对账(捕捉新装/卸载的应用)并聚焦搜索框
         .onReceive(NotificationCenter.default.publisher(for: .refocusSearch)) { _ in
+            store.refresh()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 searchFocused = true
             }
