@@ -16,13 +16,8 @@ enum AppActions {
 
         // 与系统一致:目录型 file:// URL(带尾斜杠),实测 Dock 存的即此格式
         let urlString = URL(fileURLWithPath: url.path, isDirectory: true).absoluteString
-        let path = url.path
-        let alreadyExists = apps.contains { entry in
-            let stored = (((entry["tile-data"] as? [String: Any])?["file-data"]
-                            as? [String: Any])?["_CFURLString"] as? String) ?? ""
-            return stored == urlString || stored == path || stored == path + "/"
-                || stored == urlString + "/"
-        }
+        let targetPath = normalizedPath(url.path)
+        let alreadyExists = apps.contains { entryPath($0) == targetPath }
         guard !alreadyExists else { return false }
 
         // 与系统 Dock 相同的条目结构(_CFURLStringType 15 = file:// URL)
@@ -30,13 +25,51 @@ enum AppActions {
                                                  "_CFURLStringType": 15]]])
         CFPreferencesSetAppValue(key, apps as CFArray, domain)
         CFPreferencesAppSynchronize(domain)
+        restartDock()
+        return true
+    }
 
-        // 重启 Dock 使配置生效
+    /// 从程序坞移除应用条目(卸载后清理)。返回是否实际移除。
+    @discardableResult
+    static func removeFromDock(_ url: URL) -> Bool {
+        let domain = "com.apple.dock" as CFString
+        let key = "persistent-apps" as CFString
+        guard let apps = CFPreferencesCopyAppValue(key, domain) as? [[String: Any]] else {
+            return false
+        }
+        let targetPath = normalizedPath(url.path)
+        let remaining = apps.filter { entryPath($0) != targetPath }
+        guard remaining.count != apps.count else { return false }
+
+        CFPreferencesSetAppValue(key, remaining as CFArray, domain)
+        CFPreferencesAppSynchronize(domain)
+        restartDock()
+        return true
+    }
+
+    /// 解析 Dock 条目里的应用路径(_CFURLString 可能是 file:// URL 或纯路径,可能带尾斜杠/编码)。
+    private static func entryPath(_ entry: [String: Any]) -> String {
+        let stored = (((entry["tile-data"] as? [String: Any])?["file-data"]
+                        as? [String: Any])?["_CFURLString"] as? String) ?? ""
+        if stored.hasPrefix("file://"), let parsed = URL(string: stored) {
+            return normalizedPath(parsed.path)
+        }
+        return normalizedPath(stored)
+    }
+
+    /// 去掉尾斜杠的规范路径。
+    private static func normalizedPath(_ path: String) -> String {
+        var result = path
+        while result.count > 1, result.hasSuffix("/") { result.removeLast() }
+        return result
+    }
+
+    /// 重启 Dock 使配置生效。
+    private static func restartDock() {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
         task.arguments = ["Dock"]
         try? task.run()
-        return true
     }
 
     // MARK: - 简介信息
@@ -126,6 +159,8 @@ enum AppActions {
                 for residual in residualPaths(bundleID: bundleID) {
                     try? FileManager.default.trashItem(at: residual, resultingItemURL: nil)
                 }
+                // 程序坞里若还挂着该应用,一并移除(否则留下"在废纸篓中"的死图标)
+                removeFromDock(appURL)
             }
             DispatchQueue.main.async { completion(errorMessage) }
         }
