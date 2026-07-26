@@ -100,16 +100,58 @@ enum AppActions {
     }
 
     /// 卸载:应用本体与残留数据全部移入废纸篓(可从废纸篓恢复)。
-    /// 返回错误描述;nil = 成功。残留清理失败不阻断主流程。
-    static func uninstall(appURL: URL, bundleID: String?) -> String? {
+    /// 直接搬移权限不足时(root 所有 / App 管理保护),退回让 Finder 代为删除——
+    /// Finder 有 App 管理权限,必要时会弹它自己的管理员认证。
+    /// 后台执行;`beforeFinderFallback` 在退回 Finder 前于主线程调用(用于收起全屏覆盖层,
+    /// 否则 Finder 的认证弹窗会被挡住);`completion` 主线程回调,参数为错误描述(nil = 成功)。
+    static func uninstall(appURL: URL, bundleID: String?,
+                          beforeFinderFallback: @escaping () -> Void,
+                          completion: @escaping (String?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            var errorMessage: String?
+            do {
+                try FileManager.default.trashItem(at: appURL, resultingItemURL: nil)
+            } catch {
+                DispatchQueue.main.sync { beforeFinderFallback() }
+                if !finderTrash(appURL) {
+                    errorMessage = """
+                    无法移除“\(appURL.deletingPathExtension().lastPathComponent)”:权限不足,\
+                    且 Finder 代删被拒或被取消。
+                    可在 Finder 中手动将其移到废纸篓;若从未弹出过授权窗口,\
+                    请在 系统设置 → 隐私与安全性 → 自动化 中允许本应用控制 Finder 后重试。
+                    """
+                }
+            }
+            if errorMessage == nil {
+                for residual in residualPaths(bundleID: bundleID) {
+                    try? FileManager.default.trashItem(at: residual, resultingItemURL: nil)
+                }
+            }
+            DispatchQueue.main.async { completion(errorMessage) }
+        }
+    }
+
+    /// 让 Finder 把文件移到废纸篓(经 osascript 子进程,避免阻塞主线程;
+    /// 首次调用会触发系统"控制 Finder"授权询问)。
+    private static func finderTrash(_ url: URL) -> Bool {
+        let escaped = url.path
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let script = "tell application \"Finder\" to delete (POSIX file \"\(escaped)\" as alias)"
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        task.arguments = ["-e", script]
+        task.standardOutput = Pipe()
+        task.standardError = Pipe()
         do {
-            try FileManager.default.trashItem(at: appURL, resultingItemURL: nil)
+            try task.run()
         } catch {
-            return "无法移除应用:\(error.localizedDescription)"
+            return false
         }
-        for residual in residualPaths(bundleID: bundleID) {
-            try? FileManager.default.trashItem(at: residual, resultingItemURL: nil)
-        }
-        return nil
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else { return false }
+        // Finder 返回成功后确认文件确实已不在原位
+        return !FileManager.default.fileExists(atPath: url.path)
     }
 }
