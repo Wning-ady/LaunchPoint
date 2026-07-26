@@ -6,11 +6,19 @@ struct AppItem: Identifiable {
     let name: String        // display name without the ".app" suffix
     let url: URL
     let icon: NSImage
+    let bundleID: String?
+    var alias: String?      // 用户自定义别名(来自布局存储)
+
+    /// 界面显示名:有别名用别名,否则用默认名。
+    var displayName: String {
+        if let alias, !alias.isEmpty { return alias }
+        return name
+    }
 }
 
-/// Scans the standard macOS application directories for installed apps.
+/// Scans application directories for installed apps.
 enum AppScanner {
-    private static let searchDirs: [String] = [
+    static let defaultSearchDirs: [String] = [
         "/Applications",
         "/Applications/Utilities",
         "/System/Applications",
@@ -18,26 +26,29 @@ enum AppScanner {
         (("~/Applications") as NSString).expandingTildeInPath,
     ]
 
-    /// Returns every `.app` found in the search directories, sorted by name.
-    static func scan() -> [AppItem] {
+    /// Returns every `.app` found in the given source directories, sorted by name.
+    static func scan(sources: [String] = defaultSearchDirs) -> [AppItem] {
         let fm = FileManager.default
         let workspace = NSWorkspace.shared
         var seen = Set<String>()
         var items: [AppItem] = []
 
-        for dir in searchDirs {
+        for dir in sources {
             guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { continue }
             for entry in entries where entry.hasSuffix(".app") {
                 let fullPath = dir + "/" + entry
                 guard seen.insert(fullPath).inserted else { continue }
                 let name = String(entry.dropLast(4))
+                let url = URL(fileURLWithPath: fullPath)
                 let icon = workspace.icon(forFile: fullPath)
                 icon.size = NSSize(width: 72, height: 72)
                 items.append(
                     AppItem(id: fullPath,
                             name: name,
-                            url: URL(fileURLWithPath: fullPath),
-                            icon: icon)
+                            url: url,
+                            icon: icon,
+                            bundleID: Bundle(url: url)?.bundleIdentifier,
+                            alias: nil)
                 )
             }
         }
