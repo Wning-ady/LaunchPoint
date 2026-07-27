@@ -4,8 +4,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-VERSION="0.13.0"
-PRERELEASE="beta.1"
+VERSION="0.1.0"
 BUILD="1"
 MINIMUM_MACOS="14.0"
 APP_NAME="LaunchPoint"
@@ -34,7 +33,7 @@ write_info_plist() {
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleShortVersionString</key><string>${VERSION}</string>
 <key>CFBundleVersion</key><string>${BUILD}</string>
-<key>LaunchPointReleaseVersion</key><string>${VERSION}-${PRERELEASE}</string>
+<key>LaunchPointReleaseVersion</key><string>${VERSION}</string>
 <key>LSArchitecturePriority</key><array><string>${arch}</string></array>
 <key>LSMinimumSystemVersion</key><string>${MINIMUM_MACOS}</string>
 <key>LSUIElement</key><true/>
@@ -46,7 +45,7 @@ build_architecture() {
   local arch="$1"
   local app_dir="$DIST_DIR/${APP_NAME}-${arch}.app"
   local staging_dir="$STAGING_ROOT/$arch"
-  local dmg="$DIST_DIR/${APP_NAME}-v${VERSION}-${PRERELEASE}-${arch}.dmg"
+  local dmg="$DIST_DIR/${APP_NAME}-v${VERSION}-${arch}.dmg"
 
   echo "Building ${APP_NAME} for ${arch}..."
   mkdir -p \
