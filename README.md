@@ -1,51 +1,87 @@
 > **纯 AI 编写：LaunchPoint 的代码、界面、图标、文档与构建流程均由 AI 完整生成和实现。**
 
-# LaunchPoint
+<p align="center">
+  <img src="Resources/AppIcon.svg" width="144" height="144" alt="LaunchPoint 图标">
+</p>
 
-LaunchPoint 是一款面向 macOS 的原生应用启动器，专注于快速唤起、流畅浏览、即时搜索与可持久化整理。
+<h1 align="center">LaunchPoint</h1>
 
-当前版本：`v0.13.0-beta.1`
-系统要求：macOS 14 或更高版本
-处理器：Apple Silicon `arm64` 或 Intel `x86_64`
+<p align="center">
+  原生 macOS 应用启动器。快速唤起、即时搜索，自由整理你的应用。
+</p>
 
-[下载发行版](https://github.com/Wning-ady/LaunchPoint/releases) · [源代码](https://github.com/Wning-ady/LaunchPoint) · [问题反馈](https://github.com/Wning-ady/LaunchPoint/issues)
+<p align="center">
+  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.13.0-beta.1/LaunchPoint-v0.13.0-beta.1-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
+  ·
+  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.13.0-beta.1/LaunchPoint-v0.13.0-beta.1-x86_64.dmg"><strong>Intel 下载</strong></a>
+  ·
+  <a href="https://github.com/Wning-ady/LaunchPoint/releases">全部发行版</a>
+  ·
+  <a href="https://github.com/Wning-ady/LaunchPoint/issues">问题反馈</a>
+</p>
 
-## 主要功能
+<p align="center">
+  macOS 14+ · Swift 6 · MIT License · 当前版本 v0.13.0-beta.1
+</p>
 
-- 全屏无边框应用网格，支持壁纸和系统毛玻璃背景。
-- 横向分页与纵向连续滚动两种显示模式。
-- 自适应行列、图标大小、横向间距和纵向间距。
-- 图标与标签根据屏幕可用区域自动收敛，避免小屏幕越界。
-- 应用名称、缩写和拼音即时搜索，并支持键盘导航。
-- 鼠标、触控板、滚轮、方向键和页码圆点翻页。
-- 应用拖拽排序、跨页移动、创建文件夹和文件夹改名。
-- 应用隐藏、恢复、别名、简介、卸载和在 Finder 中显示。
-- 空白区域右键菜单，以及应用和文件夹的独立右键菜单。
-- 可移动设置面板，调整过程实时预览并防抖保存。
-- 自定义全局快捷键、F4 开关、触发角和多显示器策略。
-- 登录时启动、菜单栏入口、布局导入导出与应用来源管理。
-- 应用内检查 GitHub Releases 更新，并自动匹配当前处理器的安装包。
-- 后台扫描、图标缓存、搜索缓存和壁纸降采样。
+## 简介
 
-## 视觉
+LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整的网格呈现 Mac 上的应用，并让搜索、翻页、整理和个性化设置保持快速直接。
 
-LaunchPoint 使用统一的米白、炭黑和系统蓝配色。应用图标、设置面板、搜索框、选中状态和页码采用同一视觉语言，保持清晰、克制和易辨识。
+应用扫描、图标读取、搜索和壁纸处理均采用后台任务；布局与偏好保存在本机，不需要账号。
+
+## 功能
+
+### 浏览与搜索
+
+- 横向分页与纵向连续滚动两种网格模式。
+- 支持应用名称、缩写和拼音即时搜索。
+- 支持鼠标、触控板、滚轮、方向键和页码导航。
+- 根据屏幕和行列数自动收敛图标与标签尺寸。
+
+### 应用整理
+
+- 拖拽排序、跨页移动、创建文件夹和文件夹改名。
+- 隐藏、恢复、别名、简介、卸载及在 Finder 中显示。
+- 布局导入、导出和持久化保存。
+- 应用与文件夹独立右键菜单。
+
+### 外观与布局
+
+- 自定义行列数、图标大小、横向间距和纵向间距。
+- 系统毛玻璃与当前桌面壁纸背景。
+- 设置调整实时预览，并通过防抖减少连续写盘。
+- 米白、炭黑和系统蓝组成的统一界面配色。
+
+### 系统集成
+
+- 自定义全局快捷键、F4 开关和触发角。
+- 主显示器、活跃显示器和鼠标所在显示器策略。
+- 登录时启动与菜单栏入口。
+- 应用内检查 GitHub Releases 更新，并自动匹配当前处理器架构。
 
 ## 安装
 
-1. 按处理器下载 `LaunchPoint-v0.13.0-beta.1-arm64.dmg` 或 `LaunchPoint-v0.13.0-beta.1-x86_64.dmg`。
-2. 打开镜像并将 `LaunchPoint.app` 拖入 `Applications`。
-3. 首次启动时按照 macOS 提示确认打开。
+| Mac | 安装包 |
+| --- | --- |
+| Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.13.0-beta.1/LaunchPoint-v0.13.0-beta.1-arm64.dmg) |
+| Intel | [下载 x86_64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.13.0-beta.1/LaunchPoint-v0.13.0-beta.1-x86_64.dmg) |
 
-当前测试包使用 ad-hoc 签名，尚未进行 Developer ID 签名和公证。
+1. 打开与你的 Mac 匹配的 DMG。
+2. 将 `LaunchPoint.app` 拖入 `Applications`。
+3. 首次启动时右键应用并选择“打开”。
 
-## 构建
+当前 Beta 使用 ad-hoc 签名，尚未进行 Developer ID 签名与公证。
+
+## 源码构建
+
+需要 macOS 14 或更高版本及 Xcode Command Line Tools。运行：
 
 ```bash
 ./build.sh
 ```
 
-构建产物：
+脚本会一次生成两种架构的 App 与 DMG：
 
 ```text
 dist/LaunchPoint-arm64.app
@@ -65,21 +101,8 @@ xcrun swiftc -warnings-as-errors -typecheck \
   -framework ServiceManagement
 ```
 
-## 数据位置
-
-布局数据保存在：
-
-```text
-~/Library/Application Support/LaunchPoint/layout.json
-```
-
-偏好设置使用 bundle identifier：
-
-```text
-com.waning.launchpoint
-```
-
-## 项目结构
+<details>
+<summary><strong>项目结构</strong></summary>
 
 ```text
 Sources/LaunchPoint/
@@ -98,9 +121,28 @@ Resources/
 └── AppIcon.icns
 ```
 
+</details>
+
+<details>
+<summary><strong>本地数据</strong></summary>
+
+布局数据保存在：
+
+```text
+~/Library/Application Support/LaunchPoint/layout.json
+```
+
+偏好设置使用 bundle identifier：
+
+```text
+com.waning.launchpoint
+```
+
+</details>
+
 ## 开源
 
-LaunchPoint 的源代码依据 [MIT License](LICENSE) 公开。欢迎通过 Issue 提交问题、建议和兼容性反馈。
+LaunchPoint 依据 [MIT License](LICENSE) 开源。欢迎通过 [Issue](https://github.com/Wning-ady/LaunchPoint/issues) 提交问题、建议和兼容性反馈。
 
 ## 当前限制
 
