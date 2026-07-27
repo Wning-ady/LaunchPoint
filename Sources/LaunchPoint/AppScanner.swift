@@ -18,6 +18,8 @@ struct AppItem: Identifiable {
 
 /// Scans application directories for installed apps.
 enum AppScanner {
+    private static let iconCache = NSCache<NSString, NSImage>()
+
     static let defaultSearchDirs: [String] = [
         "/Applications",
         "/Applications/Utilities",
@@ -40,8 +42,15 @@ enum AppScanner {
                 guard seen.insert(fullPath).inserted else { continue }
                 let name = String(entry.dropLast(4))
                 let url = URL(fileURLWithPath: fullPath)
-                let icon = workspace.icon(forFile: fullPath)
-                icon.size = NSSize(width: 72, height: 72)
+                let cacheKey = fullPath as NSString
+                let icon: NSImage
+                if let cached = iconCache.object(forKey: cacheKey) {
+                    icon = cached
+                } else {
+                    icon = workspace.icon(forFile: fullPath)
+                    icon.size = NSSize(width: 96, height: 96)
+                    iconCache.setObject(icon, forKey: cacheKey)
+                }
                 items.append(
                     AppItem(id: fullPath,
                             name: name,

@@ -18,6 +18,8 @@ enum SearchEngine {
     /// 键缓存:同一文本只算一次拼音(CFStringTransform 有开销)。
     /// 仅主线程访问(SwiftUI body / onSubmit / 预热均在主线程)。
     private static var cache: [String: Keys] = [:]
+    /// 查询缓存:同一批应用和查询不重复打分排序。
+    private static var rankCache: [String: [AppItem]] = [:]
 
     static func keys(for text: String) -> Keys {
         if let hit = cache[text] { return hit }
@@ -226,7 +228,16 @@ enum SearchEngine {
     static func rank(_ query: String, in apps: [AppItem]) -> [AppItem] {
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return apps }
-        return apps
+        var hasher = Hasher()
+        hasher.combine(apps.count)
+        for app in apps {
+            hasher.combine(app.id)
+            hasher.combine(app.alias ?? "")
+        }
+        let cacheKey = "\(q.lowercased())#\(hasher.finalize())"
+        if let cached = rankCache[cacheKey] { return cached }
+
+        let result = apps
             .compactMap { app -> (AppItem, Int)? in
                 var best = score(app.name, query: q)
                 if let alias = app.alias, !alias.isEmpty {
@@ -242,5 +253,10 @@ enum SearchEngine {
                 return a.0.displayName.localizedCaseInsensitiveCompare(b.0.displayName) == .orderedAscending
             }
             .map(\.0)
+        rankCache[cacheKey] = result
+        if rankCache.count > 32, let first = rankCache.keys.first {
+            rankCache.removeValue(forKey: first)
+        }
+        return result
     }
 }
