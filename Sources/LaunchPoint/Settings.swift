@@ -4,6 +4,52 @@ import Carbon.HIToolbox
 import ServiceManagement
 import UniformTypeIdentifiers
 
+private final class SettingsDragHandleView: NSView {
+    var dragChanged: ((CGSize) -> Void)?
+    var dragEnded: ((CGSize) -> Void)?
+    private var originInWindow: NSPoint?
+
+    override func mouseDown(with event: NSEvent) {
+        originInWindow = event.locationInWindow
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let originInWindow else { return }
+        dragChanged?(translation(from: originInWindow, to: event.locationInWindow))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let originInWindow else { return }
+        dragEnded?(translation(from: originInWindow, to: event.locationInWindow))
+        self.originInWindow = nil
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .openHand)
+    }
+
+    private func translation(from start: NSPoint, to current: NSPoint) -> CGSize {
+        CGSize(width: current.x - start.x, height: start.y - current.y)
+    }
+}
+
+private struct SettingsDragHandle: NSViewRepresentable {
+    let dragChanged: (CGSize) -> Void
+    let dragEnded: (CGSize) -> Void
+
+    func makeNSView(context: Context) -> SettingsDragHandleView {
+        let view = SettingsDragHandleView()
+        view.dragChanged = dragChanged
+        view.dragEnded = dragEnded
+        return view
+    }
+
+    func updateNSView(_ nsView: SettingsDragHandleView, context: Context) {
+        nsView.dragChanged = dragChanged
+        nsView.dragEnded = dragEnded
+    }
+}
+
 /// 唤起快捷键选项(v1 提供常用组合;完全自定义录制后续做)。
 enum HotkeyOption: String, CaseIterable, Identifiable {
     case optionSpace
@@ -101,7 +147,7 @@ struct LayoutBackupDocument: FileDocument {
     }
 }
 
-/// 用户设置(UserDefaults 持久化,参照 LaunchOS 的 columns/rows/快捷键键值设计)。
+/// 用户设置(UserDefaults 持久化)。
 enum Settings {
     private static let defaults = UserDefaults.standard
 
@@ -119,6 +165,43 @@ enum Settings {
             return value == 0 ? 5 : min(max(value, 3), 8)
         }
         set { defaults.set(min(max(newValue, 3), 8), forKey: "GridRows") }
+    }
+
+    /// 图标比例只影响网格的视觉尺寸，不改变每页的容量。
+    static var iconScale: Double {
+        get {
+            let value = defaults.object(forKey: "GridIconScale") as? Double ?? 1
+            return min(max(value, 0.7), 1.3)
+        }
+        set { defaults.set(min(max(newValue, 0.7), 1.3), forKey: "GridIconScale") }
+    }
+
+    static var horizontalSpacing: Double {
+        get {
+            let value = defaults.object(forKey: "GridHorizontalSpacing") as? Double ?? 12
+            return min(max(value, 4), 40)
+        }
+        set { defaults.set(min(max(newValue, 4), 40), forKey: "GridHorizontalSpacing") }
+    }
+
+    static var verticalSpacing: Double {
+        get {
+            let value = defaults.object(forKey: "GridVerticalSpacing") as? Double ?? 12
+            return min(max(value, 4), 40)
+        }
+        set { defaults.set(min(max(newValue, 4), 40), forKey: "GridVerticalSpacing") }
+    }
+
+    /// Move the old untouched 16/20 defaults to the compact B-theme baseline once.
+    static func migrateLegacySpacingDefaultsIfNeeded() {
+        guard defaults.integer(forKey: "GridSpacingDefaultsVersion") < 1 else { return }
+        let horizontal = defaults.object(forKey: "GridHorizontalSpacing") as? Double
+        let vertical = defaults.object(forKey: "GridVerticalSpacing") as? Double
+        if horizontal == 16, vertical == 20 {
+            defaults.set(12.0, forKey: "GridHorizontalSpacing")
+            defaults.set(12.0, forKey: "GridVerticalSpacing")
+        }
+        defaults.set(1, forKey: "GridSpacingDefaultsVersion")
     }
 
     static var hotkeyOption: HotkeyOption {
@@ -171,9 +254,15 @@ enum Settings {
 
 /// 独立设置窗口(⌘, 打开;修改即时生效)。
 struct SettingsPanel: View {
+    let close: () -> Void
+    let dragChanged: (CGSize) -> Void
+    let dragEnded: (CGSize) -> Void
     @State private var hotkey = Settings.hotkeyOption
-    @State private var columns = LayoutStore.columns
-    @State private var rows = LayoutStore.rows
+    @State private var columns = AppState.shared.gridColumns
+    @State private var rows = AppState.shared.gridRows
+    @State private var iconScale = AppState.shared.iconScale
+    @State private var horizontalSpacing = AppState.shared.horizontalSpacing
+    @State private var verticalSpacing = AppState.shared.verticalSpacing
     @State private var confirmArrange = false
     @State private var section: Section = .general
     @State private var backgroundStyle = Settings.backgroundStyle
@@ -186,6 +275,16 @@ struct SettingsPanel: View {
     @State private var dataMessage: String?
     @State private var sources = LayoutStore.shared.sourceRecords()
     @State private var showSourceImporter = false
+    @State private var isHoveringTitleBar = false
+    @State private var gridCommitWork: DispatchWorkItem?
+    @State private var iconCommitWork: DispatchWorkItem?
+    @State private var spacingCommitWork: DispatchWorkItem?
+    @State private var gridNeedsCommit = false
+    @State private var iconNeedsCommit = false
+    @State private var spacingNeedsCommit = false
+    @State private var gridCommitGeneration = 0
+    @State private var iconCommitGeneration = 0
+    @State private var spacingCommitGeneration = 0
 
     private enum Section: Hashable {
         case general
@@ -198,20 +297,45 @@ struct SettingsPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
+                draggableTitleRegion {
+                    HStack(spacing: 10) {
+                    Image(systemName: "gearshape.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(sectionTint(section))
+                    Text("LaunchPoint 设置")
+                        .font(.system(size: 14, weight: .semibold))
+                    Spacer()
+                    }
+                }
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 34, height: 34)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(AppTheme.secondaryText)
+                .background(AppTheme.subtleFill, in: Circle())
+                .help("关闭设置")
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 42)
+            .background(titleBarBackground)
+
+            HStack(spacing: 6) {
                 settingsTab(.general, title: "通用", symbol: "gearshape")
                 settingsTab(.interface, title: "界面", symbol: "rectangle.3.group")
                 settingsTab(.apps, title: "Apps", symbol: "square.stack.3d.up")
                 settingsTab(.advanced, title: "高级", symbol: "slider.horizontal.3")
                 settingsTab(.about, title: "关于", symbol: "info.circle")
-                Spacer()
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 16)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 8)
 
             Divider()
 
-            ScrollView {
-                Group {
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 0) {
                     switch section {
                     case .general:
                         generalSettings
@@ -225,13 +349,21 @@ struct SettingsPanel: View {
                         aboutSettings
                     }
                 }
-                .padding(28)
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .scrollIndicators(.never)
+            .scrollIndicators(.automatic)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
         }
-        .frame(width: 760, height: 650)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(width: 560, height: 440)
+        .foregroundStyle(AppTheme.charcoal)
+        .tint(AppTheme.blue)
+        .environment(\.colorScheme, .light)
+        .background(AppTheme.panelBackground, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(AppTheme.separator, lineWidth: 1))
+        .shadow(color: AppTheme.charcoal.opacity(0.2), radius: 22, y: 9)
+        .onDisappear { flushPendingPreview() }
         .alert("按名称重新排列?", isPresented: $confirmArrange) {
             Button("重新排列", role: .destructive) {
                 LayoutStore.shared.arrangeAllByName()
@@ -251,7 +383,7 @@ struct SettingsPanel: View {
         .fileExporter(isPresented: $showExporter,
                       document: backupDocument,
                       contentType: .json,
-                      defaultFilename: "LaunchpadClone-layout") { result in
+                      defaultFilename: "LaunchPoint-layout") { result in
             switch result {
             case .success:
                 dataMessage = "布局备份已导出。"
@@ -296,7 +428,7 @@ struct SettingsPanel: View {
                 .font(.title3.weight(.semibold))
 
             settingCard {
-                settingRow("开机启动", detail: "登录 macOS 后自动启动 LaunchpadClone") {
+                settingRow("开机启动", detail: "登录 macOS 后自动启动 LaunchPoint") {
                     Toggle("开机启动", isOn: Binding(get: { Settings.launchAtLogin }, set: { value in
                         Settings.launchAtLogin = value
                         (NSApp.delegate as? AppDelegate)?.setLaunchAtLogin(value)
@@ -338,7 +470,7 @@ struct SettingsPanel: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
-            Text("布局数据保存在 ~/Library/Application Support/LaunchpadClone/")
+            Text("布局数据保存在 ~/Library/Application Support/LaunchPoint/")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -361,7 +493,10 @@ struct SettingsPanel: View {
                 Divider()
 
                 settingRow("显示屏幕", detail: "启动台覆盖层显示在哪个屏幕") {
-                    Picker("显示屏幕", selection: Binding(get: { Settings.displayStrategy }, set: { Settings.displayStrategy = $0 })) {
+                    Picker("显示屏幕", selection: Binding(get: { Settings.displayStrategy }, set: {
+                        Settings.displayStrategy = $0
+                        (NSApp.delegate as? AppDelegate)?.refreshSelectedScreen()
+                    })) {
                         ForEach(DisplayStrategy.allCases) { Text($0.label).tag($0) }
                     }.labelsHidden().frame(width: 150)
                 }
@@ -393,15 +528,10 @@ struct SettingsPanel: View {
                 Divider()
 
                 settingRow("每页列数", detail: "5 至 10 列") {
-                    Stepper(value: $columns, in: 5...10) {
+                    Stepper(value: gridColumnsBinding, in: 5...10) {
                         Text("\(columns) 列")
                             .monospacedDigit()
                             .frame(width: 48, alignment: .trailing)
-                    }
-                    .onChange(of: columns) { _, newValue in
-                        Settings.columns = newValue
-                        LayoutStore.columns = newValue
-                        LayoutStore.shared.gridConfigChanged()
                     }
                 }
 
@@ -409,16 +539,38 @@ struct SettingsPanel: View {
                     .padding(.leading, 0)
 
                 settingRow("每页行数", detail: "3 至 8 行") {
-                    Stepper(value: $rows, in: 3...8) {
+                    Stepper(value: gridRowsBinding, in: 3...8) {
                         Text("\(rows) 行")
                             .monospacedDigit()
                             .frame(width: 48, alignment: .trailing)
                     }
-                    .onChange(of: rows) { _, newValue in
-                        Settings.rows = newValue
-                        LayoutStore.rows = newValue
-                        LayoutStore.shared.gridConfigChanged()
+                }
+
+                Divider()
+
+                settingRow("图标大小", detail: "只调整图标的视觉比例") {
+                    VStack(alignment: .trailing, spacing: 3) {
+                        Slider(value: iconScaleBinding, in: 0.7...1.3, step: 0.05)
+                            .frame(width: 118)
+                        Text("\(Int((iconScale * 100).rounded()))%")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
+                    .accessibilityLabel("图标大小")
+                }
+
+                Divider()
+
+                settingRow("横向间距", detail: "调整同一行图标之间的距离") {
+                    spacingSlider(value: horizontalSpacingBinding,
+                                  displayValue: Int(horizontalSpacing.rounded()))
+                }
+
+                Divider()
+
+                settingRow("纵向间距", detail: "调整相邻两行图标之间的距离") {
+                    spacingSlider(value: verticalSpacingBinding,
+                                  displayValue: Int(verticalSpacing.rounded()))
                 }
             }
 
@@ -482,7 +634,7 @@ struct SettingsPanel: View {
                     .font(.system(size: 42, weight: .medium))
                     .foregroundStyle(Color.accentColor)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("LaunchpadClone")
+                    Text("LaunchPoint")
                         .font(.title2.weight(.semibold))
                     Text("macOS 启动台替代方案")
                         .foregroundStyle(.secondary)
@@ -521,6 +673,7 @@ struct SettingsPanel: View {
                         }
                     }
                     .labelsHidden()
+                    .pickerStyle(.segmented)
                     .frame(width: 130)
                     .onChange(of: backgroundStyle) { _, newValue in
                         AppState.shared.setBackgroundStyle(newValue)
@@ -594,45 +747,49 @@ struct SettingsPanel: View {
                 .buttonStyle(.bordered)
             }
 
-            ScrollView {
-                settingCard {
-                    ForEach(sources.indices, id: \.self) { index in
-                        let source = sources[index]
-                        HStack(spacing: 10) {
-                            Image(systemName: "folder")
-                                .foregroundStyle(.secondary)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(URL(fileURLWithPath: source.path).lastPathComponent)
-                                    .font(.body.weight(.medium))
-                                    .lineLimit(1)
-                                Text(source.path)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                            Spacer(minLength: 8)
-                            Toggle("启用", isOn: Binding(
-                                get: { sources[index].enabled },
-                                set: { enabled in
-                                    LayoutStore.shared.setSourceEnabled(source.path, enabled: enabled)
-                                    sources = LayoutStore.shared.sourceRecords()
-                                }
-                            ))
-                            .labelsHidden()
-                            .toggleStyle(.switch)
-                            Button {
-                                LayoutStore.shared.removeSource(path: source.path)
-                                sources = LayoutStore.shared.sourceRecords()
-                            } label: {
-                                Image(systemName: "minus.circle")
-                            }
-                            .buttonStyle(.plain)
+            settingCard {
+                if sources.isEmpty {
+                    Text("还没有添加应用来源。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                ForEach(sources, id: \.path) { source in
+                    HStack(spacing: 10) {
+                        Image(systemName: "folder")
                             .foregroundStyle(.secondary)
-                            .help("移除来源")
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(URL(fileURLWithPath: source.path).lastPathComponent)
+                                .font(.body.weight(.medium))
+                                .lineLimit(1)
+                            Text(source.path)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
                         }
-                        if index < sources.count - 1 {
-                            Divider()
+                        Spacer(minLength: 8)
+                        Toggle("启用", isOn: Binding(
+                            get: { sources.first(where: { $0.path == source.path })?.enabled ?? source.enabled },
+                            set: { enabled in
+                                LayoutStore.shared.setSourceEnabled(source.path, enabled: enabled)
+                                sources = LayoutStore.shared.sourceRecords()
+                            }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        Button {
+                            LayoutStore.shared.removeSource(path: source.path)
+                            sources = LayoutStore.shared.sourceRecords()
+                        } label: {
+                            Image(systemName: "minus.circle")
                         }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .help("移除来源")
+                    }
+                    if source.path != sources.last?.path {
+                        Divider()
                     }
                 }
             }
@@ -648,24 +805,176 @@ struct SettingsPanel: View {
         Button {
             section = target
         } label: {
-            VStack(spacing: 5) {
+            HStack(spacing: 6) {
                 Image(systemName: symbol)
-                    .font(.system(size: 23, weight: .medium))
+                    .font(.system(size: 13, weight: .semibold))
                 Text(title)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.system(size: 12, weight: .medium))
             }
-            .frame(width: 92, height: 70)
-            .foregroundStyle(section == target ? Color.accentColor : Color.secondary)
-            .background(section == target ? Color.primary.opacity(0.08) : .clear,
+            .frame(maxWidth: .infinity, minHeight: 34)
+            .foregroundStyle(section == target ? sectionTint(target) : AppTheme.secondaryText)
+            .background(section == target ? sectionTint(target).opacity(0.16) : .clear,
                         in: RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
     }
 
+    /// 只有标题和明确的空白区域接收拖动，标签与关闭按钮保留独立点击。
+    private func draggableTitleRegion<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .background(Color.white.opacity(0.001))
+            .contentShape(Rectangle())
+            .overlay(SettingsDragHandle(dragChanged: dragChanged, dragEnded: dragEnded))
+            .help("拖动设置窗口")
+    }
+
+    private var titleBarBackground: some View {
+        Rectangle()
+            .fill(isHoveringTitleBar ? AppTheme.subtleFill : Color.clear)
+            .animation(.easeOut(duration: 0.14), value: isHoveringTitleBar)
+            .allowsHitTesting(false)
+    }
+
+    private func sectionTint(_ target: Section) -> Color {
+        _ = target
+        return AppTheme.blue
+    }
+
+    private var gridColumnsBinding: Binding<Int> {
+        Binding(
+            get: { columns },
+            set: { updateGrid(columns: $0, rows: rows) }
+        )
+    }
+
+    private var gridRowsBinding: Binding<Int> {
+        Binding(
+            get: { rows },
+            set: { updateGrid(columns: columns, rows: $0) }
+        )
+    }
+
+    private var iconScaleBinding: Binding<Double> {
+        Binding(
+            get: { iconScale },
+            set: { newValue in
+                let bounded = min(max(newValue, 0.7), 1.3)
+                guard iconScale != bounded else { return }
+                iconScale = bounded
+                AppState.shared.previewIconScale(bounded)
+                iconNeedsCommit = true
+                iconCommitWork?.cancel()
+                iconCommitGeneration &+= 1
+                let generation = iconCommitGeneration
+                let work = DispatchWorkItem {
+                    guard generation == iconCommitGeneration else { return }
+                    Settings.iconScale = bounded
+                    iconNeedsCommit = false
+                }
+                iconCommitWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.24, execute: work)
+            }
+        )
+    }
+
+    private var horizontalSpacingBinding: Binding<Double> {
+        Binding(
+            get: { horizontalSpacing },
+            set: { updateSpacing(horizontal: $0, vertical: verticalSpacing) }
+        )
+    }
+
+    private var verticalSpacingBinding: Binding<Double> {
+        Binding(
+            get: { verticalSpacing },
+            set: { updateSpacing(horizontal: horizontalSpacing, vertical: $0) }
+        )
+    }
+
+    private func spacingSlider(value: Binding<Double>, displayValue: Int) -> some View {
+        VStack(alignment: .trailing, spacing: 3) {
+            Slider(value: value, in: 4...40, step: 1)
+                .frame(width: 118)
+            Text("\(displayValue) pt")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func updateSpacing(horizontal: Double, vertical: Double) {
+        let boundedHorizontal = min(max(horizontal, 4), 40)
+        let boundedVertical = min(max(vertical, 4), 40)
+        guard horizontalSpacing != boundedHorizontal || verticalSpacing != boundedVertical else {
+            return
+        }
+        horizontalSpacing = boundedHorizontal
+        verticalSpacing = boundedVertical
+        AppState.shared.previewSpacing(horizontal: boundedHorizontal, vertical: boundedVertical)
+        spacingNeedsCommit = true
+        spacingCommitWork?.cancel()
+        spacingCommitGeneration &+= 1
+        let generation = spacingCommitGeneration
+        let work = DispatchWorkItem {
+            guard generation == spacingCommitGeneration else { return }
+            Settings.horizontalSpacing = boundedHorizontal
+            Settings.verticalSpacing = boundedVertical
+            spacingNeedsCommit = false
+        }
+        spacingCommitWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24, execute: work)
+    }
+
+    /// 行列变化直接提交给展示模型，因此开启设置面板时底层网格立即重排。
+    private func updateGrid(columns newColumns: Int, rows newRows: Int) {
+        let boundedColumns = min(max(newColumns, 5), 10)
+        let boundedRows = min(max(newRows, 3), 8)
+        guard columns != boundedColumns || rows != boundedRows else { return }
+        columns = boundedColumns
+        rows = boundedRows
+        AppState.shared.previewGrid(columns: boundedColumns, rows: boundedRows)
+        gridNeedsCommit = true
+        gridCommitWork?.cancel()
+        gridCommitGeneration &+= 1
+        let generation = gridCommitGeneration
+        let work = DispatchWorkItem {
+            guard generation == gridCommitGeneration else { return }
+            commitGrid(columns: boundedColumns, rows: boundedRows)
+            gridNeedsCommit = false
+        }
+        gridCommitWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24, execute: work)
+    }
+
+    private func commitGrid(columns: Int, rows: Int) {
+        Settings.columns = columns
+        Settings.rows = rows
+        LayoutStore.columns = columns
+        LayoutStore.rows = rows
+        LayoutStore.shared.gridConfigChanged()
+    }
+
+    private func flushPendingPreview() {
+        gridCommitGeneration &+= 1
+        iconCommitGeneration &+= 1
+        spacingCommitGeneration &+= 1
+        gridCommitWork?.cancel()
+        iconCommitWork?.cancel()
+        spacingCommitWork?.cancel()
+        if gridNeedsCommit { commitGrid(columns: columns, rows: rows) }
+        if iconNeedsCommit { Settings.iconScale = iconScale }
+        if spacingNeedsCommit {
+            Settings.horizontalSpacing = horizontalSpacing
+            Settings.verticalSpacing = verticalSpacing
+        }
+    }
+
     private func settingCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         VStack(spacing: 12, content: content)
-            .padding(16)
-            .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
+            .padding(12)
+            .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8)
+                .stroke(AppTheme.separator, lineWidth: 1))
     }
 
     private func settingRow<Control: View>(_ title: String, detail: String,

@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 VERSION="0.13.0"
 BUILD="1"
 ARCH="arm64"
-APP_NAME="LaunchpadClone"
+APP_NAME="LaunchPoint"
 APP_DIR="$PWD/dist/$APP_NAME.app"
 DMG="$PWD/dist/${APP_NAME}-v${VERSION}-beta.1-${ARCH}.dmg"
 STAGING="$PWD/.dmg-staging"
@@ -14,7 +14,7 @@ STAGING="$PWD/.dmg-staging"
 echo "编译中…"
 rm -rf "$PWD/dist" "$STAGING"
 mkdir -p "$PWD/dist" "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$STAGING"
-swiftc -O -target "$ARCH-apple-macosx14.0" Sources/LaunchpadClone/*.swift \
+swiftc -O -target "$ARCH-apple-macosx14.0" Sources/LaunchPoint/*.swift \
   -framework AppKit -framework SwiftUI -framework Carbon -framework ServiceManagement \
   -o "$APP_DIR/Contents/MacOS/$APP_NAME"
 
@@ -22,11 +22,12 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleDisplayName</key><string>LaunchpadClone</string>
-<key>CFBundleExecutable</key><string>LaunchpadClone</string>
-<key>CFBundleIdentifier</key><string>com.waning.launchpadclone</string>
-<key>CFBundleName</key><string>LaunchpadClone</string>
+<key>CFBundleDisplayName</key><string>LaunchPoint</string>
+<key>CFBundleExecutable</key><string>LaunchPoint</string>
+<key>CFBundleIdentifier</key><string>com.waning.launchpoint</string>
+<key>CFBundleName</key><string>LaunchPoint</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleShortVersionString</key><string>${VERSION}</string>
 <key>CFBundleVersion</key><string>${BUILD}</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
@@ -34,7 +35,11 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 
+cp "$PWD/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 chmod +x "$APP_DIR/Contents/MacOS/$APP_NAME"
+# swiftc 会给裸 Mach-O 留下 linker ad-hoc 签名；Info.plist 随后写入时并未
+# 被它封装。最后对完整 bundle 重新做一次 ad-hoc 签名，确保测试机校验一致。
+codesign --force --deep --sign - "$APP_DIR"
 cp -R "$APP_DIR" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
 rm -f "$DMG"
