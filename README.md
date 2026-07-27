@@ -6,7 +6,9 @@ LaunchPoint 是一款面向 macOS 的原生应用启动器，专注于快速唤�
 
 当前版本：`v0.13.0-beta.1`
 系统要求：macOS 14 或更高版本
-处理器：Apple Silicon `arm64`
+处理器：Apple Silicon `arm64` 或 Intel `x86_64`
+
+[下载发行版](https://github.com/Wning-ady/LaunchPoint/releases) · [源代码](https://github.com/Wning-ady/LaunchPoint) · [问题反馈](https://github.com/Wning-ady/LaunchPoint/issues)
 
 ## 主要功能
 
@@ -22,6 +24,7 @@ LaunchPoint 是一款面向 macOS 的原生应用启动器，专注于快速唤�
 - 可移动设置面板，调整过程实时预览并防抖保存。
 - 自定义全局快捷键、F4 开关、触发角和多显示器策略。
 - 登录时启动、菜单栏入口、布局导入导出与应用来源管理。
+- 应用内检查 GitHub Releases 更新，并自动匹配当前处理器的安装包。
 - 后台扫描、图标缓存、搜索缓存和壁纸降采样。
 
 ## 视觉
@@ -30,7 +33,7 @@ LaunchPoint 使用统一的米白、炭黑和系统蓝配色。应用图标、�
 
 ## 安装
 
-1. 下载 `LaunchPoint-v0.13.0-beta.1-arm64.dmg`。
+1. 按处理器下载 `LaunchPoint-v0.13.0-beta.1-arm64.dmg` 或 `LaunchPoint-v0.13.0-beta.1-x86_64.dmg`。
 2. 打开镜像并将 `LaunchPoint.app` 拖入 `Applications`。
 3. 首次启动时按照 macOS 提示确认打开。
 
@@ -45,8 +48,10 @@ LaunchPoint 使用统一的米白、炭黑和系统蓝配色。应用图标、�
 构建产物：
 
 ```text
-dist/LaunchPoint.app
+dist/LaunchPoint-arm64.app
+dist/LaunchPoint-x86_64.app
 dist/LaunchPoint-v0.13.0-beta.1-arm64.dmg
+dist/LaunchPoint-v0.13.0-beta.1-x86_64.dmg
 ```
 
 严格类型检查：
@@ -85,6 +90,7 @@ Sources/LaunchPoint/
 ├── LayoutStore.swift    # 布局与持久化
 ├── SearchEngine.swift   # 搜索与排序
 ├── Settings.swift       # 设置界面与偏好
+├── UpdateChecker.swift  # GitHub 发行版更新检测
 └── main.swift           # 应用入口与系统集成
 
 Resources/
@@ -92,13 +98,12 @@ Resources/
 └── AppIcon.icns
 ```
 
-## 开源计划
+## 开源
 
-LaunchPoint 当前处于私有测试和持续完善阶段。完成稳定性验证、签名发布流程、隐私说明和许可证选择后，计划公开源代码，并逐步补充贡献指南、问题模板和自动化构建流程。
+LaunchPoint 的源代码依据 [MIT License](LICENSE) 公开。欢迎通过 Issue 提交问题、建议和兼容性反馈。
 
 ## 当前限制
 
-- 当前发布仅提供 Apple Silicon `arm64` 架构。
 - 安装包尚未公证。
 - 纵向滚动模式暂不支持图标拖拽重排。
 - 多显示器、触控板惯性和大量应用场景仍在持续测试。

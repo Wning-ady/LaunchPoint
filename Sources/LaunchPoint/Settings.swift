@@ -276,6 +276,7 @@ struct SettingsPanel: View {
     @State private var sources = LayoutStore.shared.sourceRecords()
     @State private var showSourceImporter = false
     @State private var isHoveringTitleBar = false
+    @StateObject private var updateChecker = UpdateChecker()
     @State private var gridCommitWork: DispatchWorkItem?
     @State private var iconCommitWork: DispatchWorkItem?
     @State private var spacingCommitWork: DispatchWorkItem?
@@ -363,7 +364,10 @@ struct SettingsPanel: View {
         .background(AppTheme.panelBackground, in: RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(AppTheme.separator, lineWidth: 1))
         .shadow(color: AppTheme.charcoal.opacity(0.2), radius: 22, y: 9)
-        .onDisappear { flushPendingPreview() }
+        .onDisappear {
+            flushPendingPreview()
+            updateChecker.cancel()
+        }
         .alert("按名称重新排列?", isPresented: $confirmArrange) {
             Button("重新排列", role: .destructive) {
                 LayoutStore.shared.arrangeAllByName()
@@ -628,35 +632,100 @@ struct SettingsPanel: View {
     }
 
     private var aboutSettings: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 14) {
-                Image(systemName: "square.grid.3x3.fill")
-                    .font(.system(size: 42, weight: .medium))
-                    .foregroundStyle(Color.accentColor)
+                if let icon = NSImage(named: "AppIcon") {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .frame(width: 48, height: 48)
+                } else {
+                    Image(systemName: "square.grid.3x3.fill")
+                        .font(.system(size: 38, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                }
                 VStack(alignment: .leading, spacing: 4) {
                     Text("LaunchPoint")
                         .font(.title2.weight(.semibold))
-                    Text("macOS 启动台替代方案")
+                    Text("简洁、快速的 macOS 应用启动器")
                         .foregroundStyle(.secondary)
                 }
             }
             settingCard {
                 settingRow("版本", detail: "当前构建版本") {
-                    Text("0.13")
+                    Text(displayCurrentVersion)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
                 Divider()
-                settingRow("布局位置", detail: "本地保存的应用顺序与文件夹") {
-                    Text("Application Support")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                settingRow("检查更新", detail: updateStatusDetail) {
+                    HStack(spacing: 8) {
+                        if case .checking = updateChecker.state {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Button(updateCheckButtonTitle) {
+                            updateChecker.checkForUpdates()
+                        }
+                        .disabled(isCheckingForUpdates)
+                    }
+                }
+                if let release = updateChecker.availableRelease {
+                    Divider()
+                    settingRow("发现新版本", detail: release.version) {
+                        Button("下载更新") {
+                            NSWorkspace.shared.open(updateChecker.preferredDownloadURL
+                                                    ?? release.releaseURL)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+                Divider()
+                settingRow("开源地址", detail: "查看源代码、发行版和问题反馈") {
+                    Button {
+                        NSWorkspace.shared.open(UpdateChecker.repositoryURL)
+                    } label: {
+                        Label("GitHub", systemImage: "arrow.up.right.square")
+                    }
                 }
             }
-            Text("快捷键、网格、背景和应用来源都可以在这里即时调整。")
+            Text("LaunchPoint 由 AI 完整生成和实现，未来版本通过 GitHub Releases 发布。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
+        }
+    }
+
+    private var isCheckingForUpdates: Bool {
+        if case .checking = updateChecker.state { return true }
+        return false
+    }
+
+    private var displayCurrentVersion: String {
+        updateChecker.currentVersion.lowercased().hasPrefix("v")
+            ? updateChecker.currentVersion
+            : "v\(updateChecker.currentVersion)"
+    }
+
+    private var updateCheckButtonTitle: String {
+        switch updateChecker.state {
+        case .checking: return "检查中"
+        case .updateAvailable: return "重新检查"
+        default: return "检查更新"
+        }
+    }
+
+    private var updateStatusDetail: String {
+        switch updateChecker.state {
+        case .idle:
+            return "从 GitHub Releases 获取最新版本"
+        case .checking:
+            return "正在连接 GitHub"
+        case .upToDate(let latestVersion):
+            return "已是最新版本（\(latestVersion)）"
+        case .updateAvailable(let release):
+            return "可更新到 \(release.version)"
+        case .failed(let message):
+            return message
         }
     }
 
