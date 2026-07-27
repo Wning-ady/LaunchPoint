@@ -221,6 +221,22 @@ final class LayoutStore: ObservableObject {
         commitMutation()
     }
 
+    /// Move an entry immediately before or after a visible target. Resolving the
+    /// target against the real page structure avoids treating a flattened list
+    /// index as a page/slot pair when earlier pages are not full.
+    func moveEntry(_ entryID: String, relativeTo targetID: String, after: Bool) {
+        for pageIndex in pages.indices {
+            let remaining = pages[pageIndex].filter { $0.id != entryID }
+            guard let targetIndex = remaining.firstIndex(where: { $0.id == targetID }) else {
+                continue
+            }
+            moveEntry(entryID,
+                      toPage: pageIndex,
+                      slot: targetIndex + (after ? 1 : 0))
+            return
+        }
+    }
+
     // MARK: - 文件夹操作
 
     /// id 是否是文件夹。

@@ -48,7 +48,7 @@ enum AppScanner {
                     icon = cached
                 } else {
                     icon = workspace.icon(forFile: fullPath)
-                    icon.size = NSSize(width: 96, height: 96)
+                    icon.size = NSSize(width: 160, height: 160)
                     iconCache.setObject(icon, forKey: cacheKey)
                 }
                 items.append(

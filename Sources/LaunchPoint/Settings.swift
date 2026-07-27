@@ -150,6 +150,11 @@ struct LayoutBackupDocument: FileDocument {
 /// 用户设置(UserDefaults 持久化)。
 enum Settings {
     private static let defaults = UserDefaults.standard
+    static let minimumIconScale = 0.5
+    static let maximumIconScale = 1.8
+    static let minimumSpacing = 4.0
+    static let maximumSpacing = 80.0
+    static let defaultSpacing = 18.0
 
     static var columns: Int {
         get {
@@ -171,37 +176,55 @@ enum Settings {
     static var iconScale: Double {
         get {
             let value = defaults.object(forKey: "GridIconScale") as? Double ?? 1
-            return min(max(value, 0.7), 1.3)
+            return min(max(value, minimumIconScale), maximumIconScale)
         }
-        set { defaults.set(min(max(newValue, 0.7), 1.3), forKey: "GridIconScale") }
+        set {
+            defaults.set(min(max(newValue, minimumIconScale), maximumIconScale),
+                         forKey: "GridIconScale")
+        }
     }
 
     static var horizontalSpacing: Double {
         get {
-            let value = defaults.object(forKey: "GridHorizontalSpacing") as? Double ?? 12
-            return min(max(value, 4), 40)
+            let value = defaults.object(forKey: "GridHorizontalSpacing") as? Double ?? defaultSpacing
+            return min(max(value, minimumSpacing), maximumSpacing)
         }
-        set { defaults.set(min(max(newValue, 4), 40), forKey: "GridHorizontalSpacing") }
+        set {
+            defaults.set(min(max(newValue, minimumSpacing), maximumSpacing),
+                         forKey: "GridHorizontalSpacing")
+        }
     }
 
     static var verticalSpacing: Double {
         get {
-            let value = defaults.object(forKey: "GridVerticalSpacing") as? Double ?? 12
-            return min(max(value, 4), 40)
+            let value = defaults.object(forKey: "GridVerticalSpacing") as? Double ?? defaultSpacing
+            return min(max(value, minimumSpacing), maximumSpacing)
         }
-        set { defaults.set(min(max(newValue, 4), 40), forKey: "GridVerticalSpacing") }
+        set {
+            defaults.set(min(max(newValue, minimumSpacing), maximumSpacing),
+                         forKey: "GridVerticalSpacing")
+        }
     }
 
-    /// Move the old untouched 16/20 defaults to the compact B-theme baseline once.
+    /// Move untouched legacy defaults forward while preserving custom spacing.
     static func migrateLegacySpacingDefaultsIfNeeded() {
-        guard defaults.integer(forKey: "GridSpacingDefaultsVersion") < 1 else { return }
-        let horizontal = defaults.object(forKey: "GridHorizontalSpacing") as? Double
-        let vertical = defaults.object(forKey: "GridVerticalSpacing") as? Double
-        if horizontal == 16, vertical == 20 {
+        let version = defaults.integer(forKey: "GridSpacingDefaultsVersion")
+        guard version < 2 else { return }
+
+        if version < 1,
+           defaults.object(forKey: "GridHorizontalSpacing") as? Double == 16,
+           defaults.object(forKey: "GridVerticalSpacing") as? Double == 20 {
             defaults.set(12.0, forKey: "GridHorizontalSpacing")
             defaults.set(12.0, forKey: "GridVerticalSpacing")
         }
-        defaults.set(1, forKey: "GridSpacingDefaultsVersion")
+
+        let horizontal = defaults.object(forKey: "GridHorizontalSpacing") as? Double
+        let vertical = defaults.object(forKey: "GridVerticalSpacing") as? Double
+        if horizontal == 12, vertical == 12 {
+            defaults.set(defaultSpacing, forKey: "GridHorizontalSpacing")
+            defaults.set(defaultSpacing, forKey: "GridVerticalSpacing")
+        }
+        defaults.set(2, forKey: "GridSpacingDefaultsVersion")
     }
 
     static var hotkeyOption: HotkeyOption {
@@ -280,12 +303,16 @@ struct SettingsPanel: View {
     @State private var gridCommitWork: DispatchWorkItem?
     @State private var iconCommitWork: DispatchWorkItem?
     @State private var spacingCommitWork: DispatchWorkItem?
+    @State private var iconPreviewWork: DispatchWorkItem?
+    @State private var spacingPreviewWork: DispatchWorkItem?
     @State private var gridNeedsCommit = false
     @State private var iconNeedsCommit = false
     @State private var spacingNeedsCommit = false
     @State private var gridCommitGeneration = 0
     @State private var iconCommitGeneration = 0
     @State private var spacingCommitGeneration = 0
+    @State private var iconPreviewGeneration = 0
+    @State private var spacingPreviewGeneration = 0
 
     private enum Section: Hashable {
         case general
@@ -554,7 +581,9 @@ struct SettingsPanel: View {
 
                 settingRow("图标大小", detail: "只调整图标的视觉比例") {
                     VStack(alignment: .trailing, spacing: 3) {
-                        Slider(value: iconScaleBinding, in: 0.7...1.3, step: 0.05)
+                        Slider(value: iconScaleBinding,
+                               in: Settings.minimumIconScale...Settings.maximumIconScale,
+                               step: 0.05)
                             .frame(width: 118)
                         Text("\(Int((iconScale * 100).rounded()))%")
                             .font(.caption.monospacedDigit())
@@ -928,10 +957,11 @@ struct SettingsPanel: View {
         Binding(
             get: { iconScale },
             set: { newValue in
-                let bounded = min(max(newValue, 0.7), 1.3)
+                let bounded = min(max(newValue, Settings.minimumIconScale),
+                                  Settings.maximumIconScale)
                 guard iconScale != bounded else { return }
                 iconScale = bounded
-                AppState.shared.previewIconScale(bounded)
+                scheduleIconPreview(bounded)
                 iconNeedsCommit = true
                 iconCommitWork?.cancel()
                 iconCommitGeneration &+= 1
@@ -963,7 +993,9 @@ struct SettingsPanel: View {
 
     private func spacingSlider(value: Binding<Double>, displayValue: Int) -> some View {
         VStack(alignment: .trailing, spacing: 3) {
-            Slider(value: value, in: 4...40, step: 1)
+            Slider(value: value,
+                   in: Settings.minimumSpacing...Settings.maximumSpacing,
+                   step: 1)
                 .frame(width: 118)
             Text("\(displayValue) pt")
                 .font(.caption.monospacedDigit())
@@ -972,14 +1004,16 @@ struct SettingsPanel: View {
     }
 
     private func updateSpacing(horizontal: Double, vertical: Double) {
-        let boundedHorizontal = min(max(horizontal, 4), 40)
-        let boundedVertical = min(max(vertical, 4), 40)
+        let boundedHorizontal = min(max(horizontal, Settings.minimumSpacing),
+                                    Settings.maximumSpacing)
+        let boundedVertical = min(max(vertical, Settings.minimumSpacing),
+                                  Settings.maximumSpacing)
         guard horizontalSpacing != boundedHorizontal || verticalSpacing != boundedVertical else {
             return
         }
         horizontalSpacing = boundedHorizontal
         verticalSpacing = boundedVertical
-        AppState.shared.previewSpacing(horizontal: boundedHorizontal, vertical: boundedVertical)
+        scheduleSpacingPreview(horizontal: boundedHorizontal, vertical: boundedVertical)
         spacingNeedsCommit = true
         spacingCommitWork?.cancel()
         spacingCommitGeneration &+= 1
@@ -1023,16 +1057,49 @@ struct SettingsPanel: View {
         LayoutStore.shared.gridConfigChanged()
     }
 
+    /// Coalesce continuous slider events to at most one grid layout per frame.
+    private func scheduleIconPreview(_ scale: Double) {
+        iconPreviewWork?.cancel()
+        iconPreviewGeneration &+= 1
+        let generation = iconPreviewGeneration
+        let work = DispatchWorkItem {
+            guard generation == iconPreviewGeneration else { return }
+            AppState.shared.previewIconScale(scale)
+        }
+        iconPreviewWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: work)
+    }
+
+    private func scheduleSpacingPreview(horizontal: Double, vertical: Double) {
+        spacingPreviewWork?.cancel()
+        spacingPreviewGeneration &+= 1
+        let generation = spacingPreviewGeneration
+        let work = DispatchWorkItem {
+            guard generation == spacingPreviewGeneration else { return }
+            AppState.shared.previewSpacing(horizontal: horizontal, vertical: vertical)
+        }
+        spacingPreviewWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: work)
+    }
+
     private func flushPendingPreview() {
         gridCommitGeneration &+= 1
         iconCommitGeneration &+= 1
         spacingCommitGeneration &+= 1
+        iconPreviewGeneration &+= 1
+        spacingPreviewGeneration &+= 1
         gridCommitWork?.cancel()
         iconCommitWork?.cancel()
         spacingCommitWork?.cancel()
+        iconPreviewWork?.cancel()
+        spacingPreviewWork?.cancel()
         if gridNeedsCommit { commitGrid(columns: columns, rows: rows) }
-        if iconNeedsCommit { Settings.iconScale = iconScale }
+        if iconNeedsCommit {
+            AppState.shared.previewIconScale(iconScale)
+            Settings.iconScale = iconScale
+        }
         if spacingNeedsCommit {
+            AppState.shared.previewSpacing(horizontal: horizontalSpacing, vertical: verticalSpacing)
             Settings.horizontalSpacing = horizontalSpacing
             Settings.verticalSpacing = verticalSpacing
         }

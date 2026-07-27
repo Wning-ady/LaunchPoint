@@ -91,7 +91,8 @@ final class AppState: ObservableObject {
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            iconScale = min(max(scale, 0.7), 1.3)
+            iconScale = min(max(scale, Settings.minimumIconScale),
+                            Settings.maximumIconScale)
         }
     }
 
@@ -99,8 +100,10 @@ final class AppState: ObservableObject {
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            horizontalSpacing = min(max(horizontal, 4), 40)
-            verticalSpacing = min(max(vertical, 4), 40)
+            horizontalSpacing = min(max(horizontal, Settings.minimumSpacing),
+                                    Settings.maximumSpacing)
+            verticalSpacing = min(max(vertical, Settings.minimumSpacing),
+                                  Settings.maximumSpacing)
         }
     }
 
