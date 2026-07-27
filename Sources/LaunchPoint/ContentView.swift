@@ -240,32 +240,63 @@ struct ContentView: View {
     /// 分页与搜索结果共用固定列数:键盘导航需要确定的网格几何。
     private var gridColumns: [GridItem] {
         Array(repeating: GridItem(.fixed(gridCellWidth), spacing: gridColumnSpacing),
-              count: state.gridColumns)
+              count: gridColumnCount)
+    }
+
+    private var gridColumnCount: Int {
+        max(1, state.gridColumns)
+    }
+
+    private var gridRowCount: Int {
+        max(1, state.gridRows)
+    }
+
+    /// The width available to the grid after its page margins. This remains the
+    /// sizing constraint for icons, but cells no longer expand to consume all of it.
+    private var gridAvailableWidth: CGFloat {
+        guard containerWidth > 0 else { return 0 }
+        return max(0, containerWidth - 2 * Self.hPadding)
     }
 
     /// Keep the requested spacing when it fits, and compact it on narrow screens.
     private var gridColumnSpacing: CGFloat {
         let requested = CGFloat(state.horizontalSpacing)
-        guard containerWidth > 0, state.gridColumns > 1 else { return requested }
-        let usableWidth = max(0, containerWidth - 2 * Self.hPadding)
+        guard containerWidth > 0, gridColumnCount > 1 else { return requested }
         let minimumCellWidth: CGFloat = 48
-        let maximum = (usableWidth - CGFloat(state.gridColumns) * minimumCellWidth)
-            / CGFloat(state.gridColumns - 1)
+        let maximum = (gridAvailableWidth - CGFloat(gridColumnCount) * minimumCellWidth)
+            / CGFloat(gridColumnCount - 1)
         return min(requested, max(4, maximum))
     }
 
-    private var gridCellWidth: CGFloat {
+    /// Width each column could occupy if the grid filled the page. Icon scaling
+    /// continues to use this value, preserving the row/column sizing behaviour.
+    private var gridAvailableCellWidth: CGFloat {
         guard containerWidth > 0 else { return 112 }
-        let columns = max(1, state.gridColumns)
-        let usableWidth = max(0, containerWidth - 2 * Self.hPadding
-                              - CGFloat(columns - 1) * gridColumnSpacing)
-        return max(36, usableWidth / CGFloat(columns))
+        let usableWidth = max(0, gridAvailableWidth
+                              - CGFloat(gridColumnCount - 1) * gridColumnSpacing)
+        return max(36, usableWidth / CGFloat(gridColumnCount))
+    }
+
+    /// A cell wraps its icon and horizontal padding instead of expanding across
+    /// the page. Consequently `horizontalSpacing` is the visible gap between
+    /// neighbouring cells rather than a small addition to a large implicit gap.
+    private var gridCellWidth: CGFloat {
+        min(gridAvailableCellWidth, max(36, gridIconSize + 12))
+    }
+
+    private var gridContentWidth: CGFloat {
+        CGFloat(gridColumnCount) * gridCellWidth
+            + CGFloat(max(0, gridColumnCount - 1)) * gridColumnSpacing
+    }
+
+    private func gridLeadingX(pageWidth: CGFloat) -> CGFloat {
+        max(0, (pageWidth - gridContentWidth) / 2)
     }
 
     /// 图标随网格列数/行数缩放，避免设置网格后只有槽位变化而图标大小不变。
     private var gridIconSize: CGFloat {
         guard containerWidth > 0 else { return 72 }
-        let cellWidth = gridCellWidth
+        let cellWidth = gridAvailableCellWidth
         // 连续滚动时行数不是可见区域的约束；按列宽确定稳定图标尺寸，
         // 避免窗口高度或内容高度变化造成图标来回缩放。
         if state.viewMode == .scrolling {
@@ -274,8 +305,8 @@ struct ContentView: View {
         }
         guard containerHeight > 0 else { return 72 }
         let rowPitch = (containerHeight - Self.gridTop - 10
-                        - CGFloat(max(0, state.gridRows - 1)) * gridRowSpacing)
-            / CGFloat(state.gridRows)
+                        - CGFloat(max(0, gridRowCount - 1)) * gridRowSpacing)
+            / CGFloat(gridRowCount)
         let widthBound = min(104, max(24, cellWidth - 12))
         let heightBound = min(104, max(20, rowPitch - 36))
         let preferred = min(104, max(36, cellWidth * 0.64)) * state.iconScale
@@ -288,7 +319,7 @@ struct ContentView: View {
             return CGFloat(state.verticalSpacing)
         }
         guard containerHeight > 0 else { return CGFloat(state.verticalSpacing) }
-        let rows = max(1, state.gridRows)
+        let rows = gridRowCount
         guard rows > 1 else { return 0 }
         let usableHeight = max(0, containerHeight - Self.gridTop - 10)
         let minimumCellHeight: CGFloat = 50
@@ -806,7 +837,8 @@ struct ContentView: View {
                         entryCell(entry, allowsReordering: false)
                     }
                 }
-                .padding(.horizontal, Self.hPadding)
+                .frame(width: gridContentWidth)
+                .frame(maxWidth: .infinity, alignment: .top)
                 .padding(.top, Self.gridTop)
                 .padding(.bottom, 44)
             }
@@ -871,11 +903,7 @@ struct ContentView: View {
                                value: ontoHighlightID == entry.id)
             }
         }
-        // HStack proposes an unbounded horizontal size to its children. Without an
-        // explicit content width, a flexible grid grows past the page and clips the
-        // first and last columns even though the outer page frame is correct.
-        .frame(width: max(0, width - 2 * Self.hPadding))
-        .padding(.horizontal, Self.hPadding)
+        .frame(width: gridContentWidth)
         .padding(.top, Self.gridTop)
         .frame(width: width, alignment: .top)
     }
@@ -1119,15 +1147,16 @@ struct ContentView: View {
 
     /// 指针所在格序(不带中心区约束);出界返回 nil。
     private func cellIndex(xInPage: CGFloat, y: CGFloat) -> Int? {
-        let cols = LayoutStore.columns
-        let colWidth = (containerWidth - 2 * Self.hPadding
-                        - CGFloat(cols - 1) * gridColumnSpacing) / CGFloat(cols)
-        let pitch = colWidth + gridColumnSpacing
-        let col = Int(floor((xInPage - Self.hPadding) / pitch))
+        let cols = gridColumnCount
+        let pitch = gridCellWidth + gridColumnSpacing
+        let xInGrid = xInPage - gridLeadingX(pageWidth: containerWidth)
+        let col = Int(floor(xInGrid / pitch))
         guard col >= 0, col < cols else { return nil }
+        let fracX = xInGrid - CGFloat(col) * pitch
+        guard fracX >= 0, fracX <= gridCellWidth else { return nil }
         let rowPitch = gridCellHeight + gridRowSpacing
         let row = Int(floor((y - Self.gridTop) / rowPitch))
-        guard row >= 0, row < LayoutStore.rows else { return nil }
+        guard row >= 0, row < gridRowCount else { return nil }
         return row * cols + col
     }
 
@@ -1177,11 +1206,10 @@ struct ContentView: View {
 
     /// 指针是否悬停在条目的中心区(横向中央 56%、纵向中央 76%)。
     private func ontoHit(xInPage: CGFloat, y: CGFloat, entries: [PageEntry]) -> PageEntry? {
-        let cols = LayoutStore.columns
-        let colWidth = (containerWidth - 2 * Self.hPadding
-                        - CGFloat(cols - 1) * gridColumnSpacing) / CGFloat(cols)
+        let cols = gridColumnCount
+        let colWidth = gridCellWidth
         let pitch = colWidth + gridColumnSpacing
-        let xInGrid = xInPage - Self.hPadding
+        let xInGrid = xInPage - gridLeadingX(pageWidth: containerWidth)
         let col = Int(floor(xInGrid / pitch))
         guard col >= 0, col < cols else { return nil }
         let fracX = xInGrid - CGFloat(col) * pitch
@@ -1190,7 +1218,7 @@ struct ContentView: View {
         let rowPitch = gridCellHeight + gridRowSpacing
         let yInGrid = y - Self.gridTop
         let row = Int(floor(yInGrid / rowPitch))
-        guard row >= 0, row < LayoutStore.rows else { return nil }
+        guard row >= 0, row < gridRowCount else { return nil }
         let fracY = yInGrid - CGFloat(row) * rowPitch
         guard fracY > gridCellHeight * 0.12,
               fracY < gridCellHeight * 0.88 else { return nil }
@@ -1201,18 +1229,17 @@ struct ContentView: View {
 
     /// 网格插入槽位:指针越过某格中心 → 插到其后。
     private func insertionSlot(xInPage: CGFloat, y: CGFloat) -> Int {
-        let cols = LayoutStore.columns
-        let colWidth = (containerWidth - 2 * Self.hPadding
-                        - CGFloat(cols - 1) * gridColumnSpacing) / CGFloat(cols)
+        let cols = gridColumnCount
+        let colWidth = gridCellWidth
         let pitch = colWidth + gridColumnSpacing
 
-        let xInGrid = xInPage - Self.hPadding
+        let xInGrid = xInPage - gridLeadingX(pageWidth: containerWidth)
         var col = Int(floor((xInGrid - colWidth / 2) / pitch)) + 1
         col = min(max(col, 0), cols)
 
         let rowPitch = gridCellHeight + gridRowSpacing
         var row = Int(floor((y - Self.gridTop) / rowPitch))
-        row = min(max(row, 0), LayoutStore.rows - 1)
+        row = min(max(row, 0), gridRowCount - 1)
 
         return row * cols + col
     }
