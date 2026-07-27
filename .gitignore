@@ -1,4 +1,5 @@
 dist/
 .dmg-staging/
-launchpad
+.build/
+.claude/
 .DS_Store

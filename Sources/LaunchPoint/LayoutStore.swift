@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-// MARK: - 持久化模型(参照 LaunchOS 的三实体设计,见 docs/launchos-research.md)
+// MARK: - 持久化模型
 
 /// 应用记录:属于某个组(页面或文件夹),组内有序。
 struct AppRecord: Codable {
@@ -14,7 +14,7 @@ struct AppRecord: Codable {
     var order: Int            // 组内顺序
 }
 
-/// 组:页面与文件夹的统一抽象(LaunchOS 的关键设计)。
+/// 组:页面与文件夹的统一抽象。
 /// 文件夹通过 page + order 占据某页的一个槽位,与应用共享同一 order 序列。
 struct GroupRecord: Codable {
     var id: String
@@ -109,13 +109,14 @@ final class LayoutStore: ObservableObject {
     private var refreshInFlight = false
     private var refreshSources: [String] = []
     private var pendingRefresh: (generation: Int, sources: [String])?
-    private let scanQueue = DispatchQueue(label: "LaunchpadClone.application-scan",
+    private var pendingSave: DispatchWorkItem?
+    private let scanQueue = DispatchQueue(label: "LaunchPoint.application-scan",
                                           qos: .userInitiated)
 
     private static let fileURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory,
                                            in: .userDomainMask)[0]
-            .appendingPathComponent("LaunchpadClone", isDirectory: true)
+            .appendingPathComponent("LaunchPoint", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("layout.json")
     }()
@@ -131,10 +132,7 @@ final class LayoutStore: ObservableObject {
 
     /// 扫描磁盘并与已存布局对账,然后刷新展示列表并落盘。
     func refresh() {
-        refreshGeneration &+= 1
-        let sources = layout.sources.filter(\.enabled).map(\.path)
-        let scanned = AppScanner.scan(sources: sources)
-        reconcile(scanned)
+        refreshAsync()
     }
 
     /// 后台扫描应用目录，避免启动台首次出现时阻塞主线程。
@@ -162,7 +160,12 @@ final class LayoutStore: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 if self.refreshGeneration == generation {
-                    self.reconcile(scanned)
+                    // 扫描目录暂时不可读时保留旧布局，避免权限或磁盘短暂异常
+                    // 把整个启动台错误清空。
+                    let hasExistingApps = !self.layout.apps.isEmpty
+                    if !scanned.isEmpty || !hasExistingApps {
+                        self.reconcile(scanned)
+                    }
                 }
                 self.refreshInFlight = false
                 self.refreshSources = []
@@ -334,7 +337,45 @@ final class LayoutStore: ObservableObject {
 
     /// 网格行列数变化后重排(超容溢出、重建展示、落盘)。
     func gridConfigChanged() {
+        reflowPagesForGrid()
         commitMutation()
+    }
+
+    /// 网格容量变化属于用户明确发起的整体几何调整。按当前跨页顺序重新分块，
+    /// 这样增大行数时后一页的项目也会补回当前页，而不是看起来“行数没生效”。
+    private func reflowPagesForGrid() {
+        var pageGroups = layout.groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
+        guard let first = pageGroups.first else { return }
+
+        let entities = pageGroups.flatMap {
+            Self.entityList(apps: layout.apps, groups: layout.groups,
+                            pageID: $0.id, page: $0.page)
+        }
+        let requiredCount = max(1, Int(ceil(Double(entities.count) / Double(Self.capacity))))
+
+        while pageGroups.count < requiredCount {
+            let nextPage = (pageGroups.last?.page ?? first.page) + 1
+            var candidate = "page-\(nextPage)"
+            var suffix = 2
+            while layout.groups.contains(where: { $0.id == candidate }) {
+                candidate = "page-\(nextPage)-\(suffix)"
+                suffix += 1
+            }
+            let page = GroupRecord(id: candidate, isFolder: false, name: nil,
+                                   page: nextPage, order: nextPage)
+            layout.groups.append(page)
+            pageGroups.append(page)
+        }
+
+        let targets = Array(pageGroups.prefix(requiredCount))
+        for (index, entity) in entities.enumerated() {
+            let target = targets[index / Self.capacity]
+            assign(entity, pageID: target.id, page: target.page,
+                   order: index % Self.capacity)
+        }
+
+        let targetIDs = Set(targets.map(\.id))
+        layout.groups.removeAll { !$0.isFolder && !targetIDs.contains($0.id) }
     }
 
     /// 当前应用来源，按设置中的顺序返回。
@@ -530,28 +571,53 @@ final class LayoutStore: ObservableObject {
 
     /// 从当前 layout + 上次扫描结果重建分页展示列表(不重扫磁盘、不落盘)。
     private func rebuildPages() {
+        // 页面重建会在 Stepper、拖拽和扫描完成后频繁发生。先建立索引和
+        // 文件夹成员表，避免每个槽位再次对 apps/groups 做 first(where:)/filter。
+        let recordsByID = Dictionary(uniqueKeysWithValues: layout.apps.map { ($0.id, $0) })
+        let groupsByID = Dictionary(uniqueKeysWithValues: layout.groups.map { ($0.id, $0) })
+        var entitiesByPage: [String: [LayoutEntity]] = [:]
+        for record in layout.apps {
+            entitiesByPage[record.groupID, default: []].append(
+                LayoutEntity(ref: .app(record.id), order: record.order, hidden: record.hidden))
+        }
+        for group in layout.groups where group.isFolder {
+            entitiesByPage[pageGroupID(forPage: group.page), default: []]
+                .append(LayoutEntity(ref: .folder(group.id), order: group.order, hidden: false))
+        }
+
+        var membersByFolder: [String: [AppItem]] = [:]
+        for record in layout.apps {
+            guard !record.hidden,
+                  let folder = groupsByID[record.groupID], folder.isFolder,
+                  var item = scannedByPath[record.id] else { continue }
+            item.alias = record.alias
+            membersByFolder[folder.id, default: []].append(item)
+        }
+        for key in membersByFolder.keys {
+            membersByFolder[key]?.sort {
+                (recordsByID[$0.id]?.order ?? 0) < (recordsByID[$1.id]?.order ?? 0)
+            }
+        }
+
         let pageGroups = layout.groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
         pages = pageGroups.map { pg in
-            Self.entityList(apps: layout.apps, groups: layout.groups,
-                            pageID: pg.id, page: pg.page)
-                .compactMap { entity -> PageEntry? in
-                    switch entity.ref {
-                    case .app(let id):
-                        guard let record = layout.apps.first(where: { $0.id == id }),
-                              !record.hidden,
-                              var item = scannedByPath[id] else { return nil }
-                        item.alias = record.alias
-                        return .app(item)
-                    case .folder(let id):
-                        guard let folder = layout.groups.first(where: { $0.id == id })
-                        else { return nil }
-                        let members = folderItems(id)
-                        return .folder(FolderInfo(id: id,
-                                                  name: folder.name ?? "",
-                                                  preview: Array(members.prefix(4)),
-                                                  count: members.count))
-                    }
+            let entities = entitiesByPage[pg.id, default: []].sorted { $0.order < $1.order }
+            return entities.compactMap { entity -> PageEntry? in
+                switch entity.ref {
+                case .app(let id):
+                    guard let record = recordsByID[id], !record.hidden,
+                          var item = scannedByPath[id] else { return nil }
+                    item.alias = record.alias
+                    return .app(item)
+                case .folder(let id):
+                    guard let folder = groupsByID[id] else { return nil }
+                    let members = membersByFolder[id, default: []]
+                    return .folder(FolderInfo(id: id,
+                                              name: folder.name ?? "",
+                                              preview: Array(members.prefix(4)),
+                                              count: members.count))
                 }
+            }
         }
         while pages.count > 1, pages.last?.isEmpty == true {
             pages.removeLast()
@@ -563,17 +629,34 @@ final class LayoutStore: ObservableObject {
             for entry in page {
                 switch entry {
                 case .app(let a): flat.append(a)
-                case .folder(let f): flat.append(contentsOf: folderItems(f.id))
+                case .folder(let f): flat.append(contentsOf: membersByFolder[f.id, default: []])
                 }
             }
         }
         items = flat
     }
 
+    /// 文件夹记录用 page 值挂在页面组上；这里将其转换为当前页面组 id。
+    /// 旧布局的页面 id 始终遵循 page-N，其他布局仍由下面的回退查找兼容。
+    private func pageGroupID(forPage page: Int) -> String {
+        let expected = "page-\(page)"
+        if layout.groups.contains(where: { !$0.isFolder && $0.id == expected }) { return expected }
+        return layout.groups.first(where: { !$0.isFolder && $0.page == page })?.id ?? expected
+    }
+
     private func save() {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try? encoder.encode(layout).write(to: Self.fileURL, options: .atomic)
+        // 行列 Stepper 和拖拽预览会在很短时间内连续触发布局变更。
+        // 合并磁盘写入，避免主线程反复 JSON 编码造成设置面板掉帧。
+        pendingSave?.cancel()
+        let layout = layout
+        let destination = Self.fileURL
+        let work = DispatchWorkItem {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try? encoder.encode(layout).write(to: destination, options: .atomic)
+        }
+        pendingSave = work
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.24, execute: work)
     }
 
     // MARK: - 纯函数层(可独立测试)

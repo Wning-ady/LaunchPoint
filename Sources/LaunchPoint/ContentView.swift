@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import ImageIO
+import QuartzCore
 
 /// 使用 AppKit 视觉效果承载窗口级毛玻璃，避免 SwiftUI material 被透明窗口裁剪。
 private struct VisualEffectBackground: NSViewRepresentable {
@@ -18,6 +20,112 @@ private struct VisualEffectBackground: NSViewRepresentable {
         nsView.material = material
         nsView.blendingMode = blendingMode
         nsView.state = .active
+    }
+}
+
+/// 把设置面板的位置状态隔离在覆盖层内部。拖动标题栏时只重绘浮层，底下的
+/// 应用网格不会跟着每个鼠标事件重新求值。
+private final class SettingsPanelContainerView: NSView {
+    private var hostingView: NSHostingView<SettingsPanel>?
+
+    func install(_ rootView: SettingsPanel) {
+        let hostingView = NSHostingView(rootView: rootView)
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        hostingView.wantsLayer = true
+        addSubview(hostingView)
+        NSLayoutConstraint.activate([
+            hostingView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            hostingView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            hostingView.topAnchor.constraint(equalTo: topAnchor),
+            hostingView.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        self.hostingView = hostingView
+    }
+
+    func showDragTranslation(_ translation: CGSize) {
+        hostingView?.layer?.transform = CATransform3DMakeTranslation(
+            translation.width, -translation.height, 0
+        )
+    }
+
+    func clearDragTranslation() {
+        hostingView?.layer?.transform = CATransform3DIdentity
+    }
+}
+
+private struct SettingsPanelHost: NSViewRepresentable {
+    let close: () -> Void
+    let dragEnded: (CGSize) -> Void
+
+    final class Coordinator {
+        var close: () -> Void
+        var dragEnded: (CGSize) -> Void
+
+        init(close: @escaping () -> Void, dragEnded: @escaping (CGSize) -> Void) {
+            self.close = close
+            self.dragEnded = dragEnded
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(close: close, dragEnded: dragEnded)
+    }
+
+    func makeNSView(context: Context) -> SettingsPanelContainerView {
+        let container = SettingsPanelContainerView()
+        let coordinator = context.coordinator
+        container.install(SettingsPanel(
+            close: { coordinator.close() },
+            dragChanged: { [weak container] in container?.showDragTranslation($0) },
+            dragEnded: { [weak container] translation in
+                coordinator.dragEnded(translation)
+                DispatchQueue.main.async {
+                    container?.clearDragTranslation()
+                }
+            }
+        ))
+        return container
+    }
+
+    func updateNSView(_ nsView: SettingsPanelContainerView, context: Context) {
+        context.coordinator.close = close
+        context.coordinator.dragEnded = dragEnded
+    }
+}
+
+private struct MovableSettingsOverlay: View {
+    let close: () -> Void
+    @State private var offset: CGSize = .zero
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                Color.black.opacity(0.12)
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: close)
+
+                SettingsPanelHost(
+                    close: close,
+                    dragEnded: { translation in
+                        offset = bounded(
+                            CGSize(width: offset.width + translation.width,
+                                   height: offset.height + translation.height),
+                            in: geometry.size
+                        )
+                    }
+                )
+                .frame(width: 560, height: 440)
+                .offset(offset)
+                .transition(.opacity.combined(with: .scale(scale: 0.985)))
+            }
+        }
+    }
+
+    private func bounded(_ candidate: CGSize, in viewport: CGSize) -> CGSize {
+        let maxX = max(0, (viewport.width - 560) / 2 - 16)
+        let maxY = max(0, (viewport.height - 440) / 2 - 16)
+        return CGSize(width: min(max(candidate.width, -maxX), maxX),
+                      height: min(max(candidate.height, -maxY), maxY))
     }
 }
 
@@ -47,11 +155,12 @@ struct ContentView: View {
     @GestureState private var pageSwipeOffset: CGFloat = 0
     @State private var wallpaperImage: NSImage?
     @State private var wallpaperPath = ""
+    @State private var wallpaperGeneration = 0
+    @State private var wallpaperCacheKey = ""
+    @State private var wallpaperPendingKey = ""
 
     // MARK: 网格几何常量(与 pageView 布局参数保持一致)
     private static let hPadding: CGFloat = 70
-    private static let colSpacing: CGFloat = 16
-    private static let maxRowSpacing: CGFloat = 26
     private static let gridTop: CGFloat = 20
     private static let edgeMargin: CGFloat = 48
 
@@ -76,7 +185,6 @@ struct ContentView: View {
     @State private var hasLeftOrigin = false               // 指针是否已离开起拖格
     @State private var containerWidth: CGFloat = 0         // 分页容器宽度(即页宽)
     @State private var containerHeight: CGFloat = 0        // 分页容器高度(用于动态图标尺寸)
-    @State private var cellHeight: CGFloat = 120           // 单元格高度(测量,供行距推算)
     @State private var edgeFlipWork: DispatchWorkItem?
     @State private var pagingAreaFrame: CGRect = .zero     // 分页容器的窗口坐标 frame
 
@@ -99,6 +207,30 @@ struct ContentView: View {
     @State private var uninstallTarget: AppItem?
     @State private var uninstallError: String?
 
+    private var isFolderRenamePresented: Binding<Bool> {
+        Binding(get: { folderRenameID != nil }, set: { presented in
+            if !presented { folderRenameID = nil }
+        })
+    }
+
+    private var isAppRenamePresented: Binding<Bool> {
+        Binding(get: { renameTarget != nil }, set: { presented in
+            if !presented { renameTarget = nil }
+        })
+    }
+
+    private var isUninstallPresented: Binding<Bool> {
+        Binding(get: { uninstallTarget != nil }, set: { presented in
+            if !presented { uninstallTarget = nil }
+        })
+    }
+
+    private var isUninstallErrorPresented: Binding<Bool> {
+        Binding(get: { uninstallError != nil }, set: { presented in
+            if !presented { uninstallError = nil }
+        })
+    }
+
     /// onto 模式下被悬停的条目(视觉放大提示)。
     private var ontoHighlightID: String? {
         if case .onto(_, let id) = dropTarget { return id }
@@ -107,41 +239,97 @@ struct ContentView: View {
 
     /// 分页与搜索结果共用固定列数:键盘导航需要确定的网格几何。
     private var gridColumns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: Self.colSpacing),
-              count: LayoutStore.columns)
+        Array(repeating: GridItem(.fixed(gridCellWidth), spacing: gridColumnSpacing),
+              count: state.gridColumns)
+    }
+
+    /// Keep the requested spacing when it fits, and compact it on narrow screens.
+    private var gridColumnSpacing: CGFloat {
+        let requested = CGFloat(state.horizontalSpacing)
+        guard containerWidth > 0, state.gridColumns > 1 else { return requested }
+        let usableWidth = max(0, containerWidth - 2 * Self.hPadding)
+        let minimumCellWidth: CGFloat = 48
+        let maximum = (usableWidth - CGFloat(state.gridColumns) * minimumCellWidth)
+            / CGFloat(state.gridColumns - 1)
+        return min(requested, max(4, maximum))
+    }
+
+    private var gridCellWidth: CGFloat {
+        guard containerWidth > 0 else { return 112 }
+        let columns = max(1, state.gridColumns)
+        let usableWidth = max(0, containerWidth - 2 * Self.hPadding
+                              - CGFloat(columns - 1) * gridColumnSpacing)
+        return max(36, usableWidth / CGFloat(columns))
     }
 
     /// 图标随网格列数/行数缩放，避免设置网格后只有槽位变化而图标大小不变。
     private var gridIconSize: CGFloat {
-        guard containerWidth > 0, containerHeight > 0 else { return 72 }
-        let columns = LayoutStore.columns
-        let cellWidth = (containerWidth - 2 * Self.hPadding
-                     - CGFloat(columns - 1) * Self.colSpacing) / CGFloat(columns)
-        let rowPitch = (containerHeight - Self.gridTop - 18
-                        - CGFloat(max(0, LayoutStore.rows - 1)) * gridRowSpacing)
-            / CGFloat(LayoutStore.rows)
-        let widthBound = min(104, max(48, cellWidth * 0.64))
-        let heightBound = min(104, max(48, rowPitch - 38))
-        return min(widthBound, heightBound)
+        guard containerWidth > 0 else { return 72 }
+        let cellWidth = gridCellWidth
+        // 连续滚动时行数不是可见区域的约束；按列宽确定稳定图标尺寸，
+        // 避免窗口高度或内容高度变化造成图标来回缩放。
+        if state.viewMode == .scrolling {
+            let base = min(96, max(40, cellWidth * 0.64))
+            return min(max(24, cellWidth - 12), max(24, base * state.iconScale))
+        }
+        guard containerHeight > 0 else { return 72 }
+        let rowPitch = (containerHeight - Self.gridTop - 10
+                        - CGFloat(max(0, state.gridRows - 1)) * gridRowSpacing)
+            / CGFloat(state.gridRows)
+        let widthBound = min(104, max(24, cellWidth - 12))
+        let heightBound = min(104, max(20, rowPitch - 36))
+        let preferred = min(104, max(36, cellWidth * 0.64)) * state.iconScale
+        return max(20, min(widthBound, heightBound, preferred))
     }
 
     /// 行数越多，行间距越紧，保证网格仍然能在当前页面内完整显示。
     private var gridRowSpacing: CGFloat {
-        guard containerHeight > 0 else { return Self.maxRowSpacing }
-        let roughPitch = containerHeight / CGFloat(max(1, LayoutStore.rows))
-        return min(Self.maxRowSpacing, max(10, roughPitch * 0.14))
+        if state.viewMode == .scrolling {
+            return CGFloat(state.verticalSpacing)
+        }
+        guard containerHeight > 0 else { return CGFloat(state.verticalSpacing) }
+        let rows = max(1, state.gridRows)
+        guard rows > 1 else { return 0 }
+        let usableHeight = max(0, containerHeight - Self.gridTop - 10)
+        let minimumCellHeight: CGFloat = 50
+        let maximum = (usableHeight - CGFloat(rows) * minimumCellHeight)
+            / CGFloat(rows - 1)
+        return min(CGFloat(state.verticalSpacing), max(2, maximum))
     }
 
     private var gridLabelFontSize: CGFloat {
-        min(14, max(10, gridIconSize * 0.17))
+        min(14, max(9, gridIconSize * 0.17))
+    }
+
+    private var gridLabelWidth: CGFloat {
+        max(36, min(gridCellWidth - 12, max(44, gridIconSize * 1.45)))
+    }
+
+    /// Shared by visual layout and drag hit testing, so row changes cannot leave stale geometry.
+    private var gridCellHeight: CGFloat {
+        gridIconSize + 8 + gridLabelFontSize * 1.2 + 16
     }
 
     /// 展示用页面:拖拽时用预览布局,并在末尾提供一个空承接页。
     private var displayPages: [[PageEntry]] {
         if let previewPages { return previewPages }
+        if state.showSettings {
+            let entries = store.pages.flatMap { $0 }
+            let capacity = max(1, state.gridColumns * state.gridRows)
+            if entries.isEmpty { return [[]] }
+            return stride(from: 0, to: entries.count, by: capacity).map {
+                Array(entries[$0..<min($0 + capacity, entries.count)])
+            }
+        }
         var pages = store.pages
         if draggingEntry != nil { pages.append([]) }
         return pages
+    }
+
+    /// 连续模式只展示已落盘的条目。它不参与分页拖拽，因此不应因拖拽预览
+    /// 多出一个空白承接页，也不应让临时重排状态影响滚动内容。
+    private var scrollingEntries: [PageEntry] {
+        store.pages.flatMap { $0 }
     }
 
     /// 搜索结果:前缀/词首/首字母/缩写/拼音多路匹配,按匹配度排序。
@@ -156,6 +344,7 @@ struct ContentView: View {
                 .allowsHitTesting(false)
 
             mainContent
+                .allowsHitTesting(!state.showSettings)
 
             // 文件夹展开面板(盖在网格之上;拖出时隐去但视图保留,手势不断)
             if let folderID = state.openFolderID {
@@ -172,37 +361,70 @@ struct ContentView: View {
                     .allowsHitTesting(false)
                     .zIndex(30)
             }
+
+            if state.showSettings {
+                MovableSettingsOverlay(close: { state.leaveSettings() })
+                    .ignoresSafeArea()
+                .zIndex(50)
+            }
         }
-        .animation(.easeInOut(duration: 0.24), value: state.openFolderID)
+        .preferredColorScheme(.dark)
         .onAppear { loadWallpaperIfNeeded() }
-        .onChange(of: state.backgroundStyle) { _, _ in loadWallpaperIfNeeded(force: true) }
+        .onChange(of: state.backgroundStyle) { _, _ in loadWallpaperIfNeeded() }
+        .onReceive(NotificationCenter.default.publisher(for: .launchPointScreenChanged)) { _ in
+            loadWallpaperIfNeeded()
+        }
+        .onChange(of: state.gridColumns) { _, _ in clampPreviewPage() }
+        .onChange(of: state.gridRows) { _, _ in clampPreviewPage() }
+    }
+
+    private func clampPreviewPage() {
+        state.currentPage = min(state.currentPage, max(0, displayPages.count - 1))
     }
 
     private var mainContent: some View {
-        VStack(spacing: 16) {
-            searchField
+        GeometryReader { viewport in
+            ZStack {
+            // Keep the blank interaction surface behind the controls.  Attaching the
+            // menu to the outer VStack makes the grid's transparent layout area win
+            // hit testing, which in turn lets right clicks fall through to Desktop.
+            // 在透明无边框窗口中用极低透明度而非 Color.clear 保留原生命中像素；
+            // 视觉上无差异，但空白区的左键、右键与拖动不会穿透到桌面。
+            Color.black.opacity(0.001)
+                .contentShape(Rectangle())
+                .onTapGesture { dismissBlankArea() }
+                .contextMenu { blankAreaMenu }
 
-            if state.effectiveQuery.isEmpty {
-                if state.viewMode == .scrolling {
-                    scrollingGrid
-                } else {
-                    pagedGrid
-                    pageDots
+                VStack(spacing: 16) {
+                    searchField
+
+                    if state.effectiveQuery.isEmpty {
+                        if state.viewMode == .scrolling {
+                            scrollingGrid
+                        } else {
+                            pagedGrid
+                            pageDots
+                        }
+                    } else {
+                        searchResults
+                    }
                 }
-            } else {
-                searchResults
+                .frame(width: viewport.size.width, height: viewport.size.height)
+            }
+            .frame(width: viewport.size.width, height: viewport.size.height)
+            .onAppear { updateContainerWidth(viewport.size.width) }
+            .onChange(of: viewport.size.width) { _, width in
+                updateContainerWidth(width)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .contentShape(Rectangle())
-        .onTapGesture { dismiss() }   // 点击空白区域关闭(图标/搜索框/圆点会自行消费点击)
         .onAppear {
             store.refreshAsync()
             focusSearch()
         }
         .onReceive(store.$items) { items in
-            // 扫描完成后预热搜索键，避免首次输入卡顿。
-            SearchEngine.prewarm(items)
+            // 首次扫描只预热屏幕内最常用的一小批，避免应用多时打开启动台就为全部拼音做计算。
+            SearchEngine.prewarm(Array(items.prefix(24)))
         }
         // 每次从菜单栏/快捷键重新唤起时:重新对账(捕捉新装/卸载)并聚焦搜索框
         .onReceive(NotificationCenter.default.publisher(for: .refocusSearch)) { _ in
@@ -234,6 +456,12 @@ struct ContentView: View {
                 state.highlightedAppID = nil
             }
         }
+        .onChange(of: state.viewMode) { _, mode in
+            // 切换到连续滚动时终止分页拖拽，避免旧的命名坐标系和预览页残留。
+            if mode == .scrolling, draggingEntry != nil {
+                finishDrag()
+            }
+        }
         // 布局变更后若展开的文件夹已不存在(被解散),自动收起
         .onReceive(store.objectWillChange) { _ in
             DispatchQueue.main.async {
@@ -243,10 +471,7 @@ struct ContentView: View {
             }
         }
         // 重命名应用对话框
-        .alert("重命名应用", isPresented: Binding(
-            get: { renameTarget != nil },
-            set: { if !$0 { renameTarget = nil } })
-        ) {
+        .alert("重命名应用", isPresented: isAppRenamePresented) {
             TextField("名称", text: $renameText)
             Button("确定") {
                 if let app = renameTarget {
@@ -259,10 +484,7 @@ struct ContentView: View {
             Text("留空则恢复默认名称")
         }
         // 重命名文件夹对话框
-        .alert("重命名文件夹", isPresented: Binding(
-            get: { folderRenameID != nil },
-            set: { if !$0 { folderRenameID = nil } })
-        ) {
+        .alert("重命名文件夹", isPresented: isFolderRenamePresented) {
             TextField("名称", text: $folderRenameText)
             Button("确定") {
                 if let id = folderRenameID {
@@ -277,10 +499,7 @@ struct ContentView: View {
             AppInfoPanel(app: app)
         }
         // 卸载确认
-        .alert("卸载“\(uninstallTarget?.displayName ?? "")”?", isPresented: Binding(
-            get: { uninstallTarget != nil },
-            set: { if !$0 { uninstallTarget = nil } })
-        ) {
+        .alert("卸载“\(uninstallTarget?.displayName ?? "")”?", isPresented: isUninstallPresented) {
             Button("移到废纸篓", role: .destructive) {
                 if let app = uninstallTarget {
                     AppActions.uninstall(
@@ -310,14 +529,15 @@ struct ContentView: View {
                  : "应用将被移到废纸篓,可随时恢复。")
         }
         // 卸载失败提示
-        .alert("卸载失败", isPresented: Binding(
-            get: { uninstallError != nil },
-            set: { if !$0 { uninstallError = nil } })
-        ) {
+        .alert("卸载失败", isPresented: isUninstallErrorPresented) {
             Button("好", role: .cancel) { uninstallError = nil }
         } message: {
             Text(uninstallError ?? "")
         }
+    }
+
+    private func dismissBlankArea() {
+        dismiss()
     }
 
     @ViewBuilder
@@ -329,34 +549,70 @@ struct ContentView: View {
                     .scaledToFill()
                     .clipped()
                 if state.blurWallpaper {
-                    // withinWindow 由 AppKit 在 GPU 上处理，避免 SwiftUI 每帧重算高斯模糊。
-                    VisualEffectBackground(material: .hudWindow, blendingMode: .withinWindow)
-                        .opacity(0.78)
+                    Rectangle()
+                        .fill(.ultraThinMaterial)
+                        .opacity(0.82)
                 } else {
-                    Color.black.opacity(0.16)
+                    Color.black.opacity(0.22)
                 }
             }
         } else {
-            VisualEffectBackground(material: .hudWindow)
+            ZStack {
+                Color.black.opacity(0.62)
+                Rectangle().fill(.ultraThinMaterial).opacity(0.88)
+            }
         }
     }
 
-    /// 壁纸只在设置变化或首次出现时读取一次，拖拽/翻页不再触发磁盘 IO。
-    private func loadWallpaperIfNeeded(force: Bool = false) {
+    /// 壁纸按覆盖窗口所在显示器异步缩略加载。每次请求都带 generation，
+    /// 切屏或快速换壁纸后，旧任务即使晚完成也不会覆盖新结果。
+    private func loadWallpaperIfNeeded() {
         guard state.backgroundStyle == .wallpaper,
-              let screen = NSScreen.main,
-              let url = NSWorkspace.shared.desktopImageURL(for: screen) else {
+              let request = (NSApp.delegate as? AppDelegate)?.wallpaperLoadRequest() else {
+            wallpaperGeneration += 1
+            wallpaperPendingKey = ""
             wallpaperImage = nil
             wallpaperPath = ""
+            wallpaperCacheKey = ""
             return
         }
-        guard force || wallpaperPath != url.path || wallpaperImage == nil else { return }
-        wallpaperPath = url.path
+        guard wallpaperCacheKey != request.cacheKey || wallpaperImage == nil else { return }
+        guard wallpaperPendingKey != request.cacheKey else { return }
+
+        wallpaperGeneration += 1
+        let generation = wallpaperGeneration
+        wallpaperPendingKey = request.cacheKey
         DispatchQueue.global(qos: .utility).async {
-            guard let data = try? Data(contentsOf: url),
-                  let image = NSImage(data: data) else { return }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: request.maxPixelSize
+            ]
+            var decoded: (url: URL, image: CGImage)?
+            for url in request.urls {
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                      let image = CGImageSourceCreateThumbnailAtIndex(
+                        source, 0, options as CFDictionary
+                      ) else { continue }
+                decoded = (url, image)
+                break
+            }
+            guard let decoded else {
+                // 保留上一张已成功壁纸；下次唤起或切屏会再次请求。
+                DispatchQueue.main.async {
+                    guard wallpaperGeneration == generation else { return }
+                    wallpaperPendingKey = ""
+                }
+                return
+            }
             DispatchQueue.main.async {
-                wallpaperImage = image
+                guard wallpaperGeneration == generation,
+                      state.backgroundStyle == .wallpaper else { return }
+                wallpaperPendingKey = ""
+                wallpaperCacheKey = request.cacheKey
+                wallpaperPath = decoded.url.path
+                wallpaperImage = NSImage(cgImage: decoded.image, size: .zero)
             }
         }
     }
@@ -439,6 +695,13 @@ struct ContentView: View {
             }
             Divider()
         }
+        Button("返回桌面") {
+            dismiss()
+        }
+        Button("重新扫描应用") {
+            store.refreshAsync()
+        }
+        Divider()
         Button("设置…") {
             (NSApp.delegate as? AppDelegate)?.showSettingsWindow()
         }
@@ -455,10 +718,16 @@ struct ContentView: View {
             .textFieldStyle(.plain)
             .focused($searchFocused)
             .font(.system(size: 15))
+            .foregroundStyle(AppTheme.charcoal)
+            .tint(AppTheme.blue)
+            .environment(\.colorScheme, .light)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .frame(maxWidth: 460)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .background(AppTheme.paper.opacity(0.9), in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12)
+                .stroke(searchFocused ? AppTheme.blue.opacity(0.82) : AppTheme.separator,
+                        lineWidth: searchFocused ? 1.5 : 1))
             .padding(.top, 52)
             .onSubmit {
                 // 搜索后按回车直接打开第一个结果(纯空白查询不触发)
@@ -480,15 +749,30 @@ struct ContentView: View {
         GeometryReader { geo in
             let width = geo.size.width
             ZStack(alignment: .topLeading) {
+                // 只让图标间隙与网格外空白触发翻页。图标本身仍由它自己的
+                // 拖拽手势处理，避免父级分页与排序手势竞争。
+                Color.black.opacity(0.001)
+                    .contentShape(Rectangle())
+                    .highPriorityGesture(TapGesture().onEnded { dismissBlankArea() })
+                    .simultaneousGesture(pageSwipeGesture(width: width))
+                    .contextMenu { blankAreaMenu }
+
                 HStack(spacing: 0) {
                     ForEach(displayPages.indices, id: \.self) { pageIndex in
-                        pageView(displayPages[pageIndex])
+                        Group {
+                            // 只构建当前页及相邻页。大量应用时不再因图标缩放或
+                            // hover 让十几页离屏 NSImage 一起参与布局。
+                            if abs(pageIndex - state.currentPage) <= 1 {
+                                pageView(displayPages[pageIndex], width: width)
+                            } else {
+                                Color.clear
+                            }
+                        }
                             .frame(width: width, height: geo.size.height, alignment: .top)
                     }
                 }
                 // 拖拽位移实时叠加到页面偏移上,还原跟手感
                 .offset(x: -CGFloat(state.currentPage) * width + pageSwipeOffset)
-                .gesture(pageSwipeGesture(width: width))
 
                 // 跟随指针的浮动图标(拖拽中)
                 if let entry = draggingEntry {
@@ -500,47 +784,73 @@ struct ContentView: View {
             }
             .coordinateSpace(name: "pagingArea")         // 指针/浮动图标用:静止坐标系
             .onAppear {
-                containerWidth = width
                 containerHeight = geo.size.height
                 pagingAreaFrame = geo.frame(in: .global)
             }
             .onChange(of: geo.size) { _, size in
-                let w = size.width
-                containerWidth = w
                 containerHeight = size.height
                 pagingAreaFrame = geo.frame(in: .global)
             }
-            .onPreferenceChange(CellSizeKey.self) { size in
-                if size.height > 0 { cellHeight = size.height }
-            }
         }
         .clipped()
-        // 空白区域右键菜单(挂在网格区,不覆盖页码圆点/搜索框;图标有自己的菜单)
-        .contentShape(Rectangle())
-        .contextMenu { blankAreaMenu }
     }
 
     private var scrollingGrid: some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            LazyVGrid(columns: gridColumns, spacing: gridRowSpacing) {
-                ForEach(displayPages.flatMap { $0 }) { entry in
-                    entryCell(entry)
+        // GeometryReader 位于剩余的主内容区域，而不是 ScrollView 内容内部。
+        // 这样它拿到的是稳定的视口高度，不会被连续网格的内容高度反向撑大。
+        GeometryReader { geo in
+            ScrollView(.vertical, showsIndicators: true) {
+                LazyVGrid(columns: gridColumns, spacing: gridRowSpacing) {
+                    ForEach(scrollingEntries) { entry in
+                        // 连续模式保留点击、右键和文件夹入口，但不注册分页排序手势。
+                        entryCell(entry, allowsReordering: false)
+                    }
                 }
+                .padding(.horizontal, Self.hPadding)
+                .padding(.top, Self.gridTop)
+                .padding(.bottom, 44)
             }
-            .padding(.horizontal, Self.hPadding)
-            .padding(.top, Self.gridTop)
-            .padding(.bottom, 36)
+            .frame(width: geo.size.width, height: geo.size.height)
+            .background(Color.black.opacity(0.001))
+            .contentShape(Rectangle())
+            .onTapGesture { dismissBlankArea() }
+            .contextMenu { blankAreaMenu }
+            .onAppear { updateScrollingViewport(geo) }
+            .onChange(of: geo.size) { _, _ in updateScrollingViewport(geo) }
         }
-        .contentShape(Rectangle())
-        .contextMenu { blankAreaMenu }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func updateScrollingViewport(_ geometry: GeometryProxy) {
+        let size = geometry.size
+        // GeometryReader 会经历若干次极小的布局调整；过滤无意义更新，避免重建网格。
+        guard abs(containerWidth - size.width) > 0.5 || abs(containerHeight - size.height) > 0.5 else {
+            return
+        }
+        containerWidth = size.width
+        containerHeight = size.height
+    }
+
+    private func updateContainerWidth(_ width: CGFloat) {
+        guard abs(containerWidth - width) > 0.5 else { return }
+        containerWidth = width
     }
 
     private func pageSwipeGesture(width: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 8)
             .updating($pageSwipeOffset) { value, offset, _ in
+                // 父级翻页只响应横向拖动；图标排序和纵向误触不会再
+                // 同时改变页偏移，避免触控板上出现“卡住/死机”感。
+                guard !AppState.shared.isDragging,
+                      abs(value.translation.width) >= abs(value.translation.height) else {
+                    offset = 0
+                    return
+                }
                 offset = value.translation.width
             }
             .onEnded { value in
+                guard !AppState.shared.isDragging,
+                      abs(value.translation.width) >= abs(value.translation.height) else { return }
                 // 按预测终点(含速度)决定翻页,轻甩也能翻
                 let predicted = value.predictedEndTranslation.width
                 if predicted < -width / 4 {
@@ -551,39 +861,47 @@ struct ContentView: View {
             }
     }
 
-    private func pageView(_ entries: [PageEntry]) -> some View {
+    private func pageView(_ entries: [PageEntry], width: CGFloat) -> some View {
         LazyVGrid(columns: gridColumns, spacing: gridRowSpacing) {
             ForEach(entries) { entry in
                 entryCell(entry)
                     // onto 悬停:目标条目放大提示"松手即建夹/入夹"
-                    .scaleEffect(ontoHighlightID == entry.id ? 1.12 : 1)
-                    .animation(.spring(response: 0.25, dampingFraction: 0.7),
+                    .scaleEffect(ontoHighlightID == entry.id ? 1.07 : 1)
+                    .animation(.spring(response: 0.2, dampingFraction: 0.86),
                                value: ontoHighlightID == entry.id)
-                    .background(
-                        GeometryReader { g in
-                            Color.clear.preference(key: CellSizeKey.self, value: g.size)
-                        }
-                    )
             }
         }
+        // HStack proposes an unbounded horizontal size to its children. Without an
+        // explicit content width, a flexible grid grows past the page and clips the
+        // first and last columns even though the outer page frame is correct.
+        .frame(width: max(0, width - 2 * Self.hPadding))
         .padding(.horizontal, Self.hPadding)
         .padding(.top, Self.gridTop)
-        .animation(.easeInOut(duration: 0.28), value: gridIconSize)
-        .animation(.easeInOut(duration: 0.28), value: gridRowSpacing)
+        .frame(width: width, alignment: .top)
     }
 
     @ViewBuilder
-    private func entryCell(_ entry: PageEntry) -> some View {
-        switch entry {
-        case .app(let app):
-            appCell(app)
-                // 拖拽中的条目在预览槽位处半透明显示,作为落点指示
-                .opacity(app.id == draggingID ? 0.35 : 1)
-                .gesture(iconDragGesture(entry))
-        case .folder(let info):
-            folderCell(info)
-                .opacity(info.id == draggingID ? 0.35 : 1)
-                .gesture(iconDragGesture(entry))   // 文件夹图块同样可拖动排序
+    private func entryCell(_ entry: PageEntry, allowsReordering: Bool = true) -> some View {
+        Group {
+            switch entry {
+            case .app(let app):
+                if allowsReordering {
+                    appCell(app)
+                        // 拖拽中的条目在预览槽位处半透明显示,作为落点指示
+                        .opacity(app.id == draggingID ? 0.35 : 1)
+                        .gesture(iconDragGesture(entry))
+                } else {
+                    appCell(app)
+                }
+            case .folder(let info):
+                if allowsReordering {
+                    folderCell(info)
+                        .opacity(info.id == draggingID ? 0.35 : 1)
+                        .gesture(iconDragGesture(entry))   // 文件夹图块同样可拖动排序
+                } else {
+                    folderCell(info)
+                }
+            }
         }
     }
 
@@ -608,30 +926,30 @@ struct ContentView: View {
             }
             .padding(8)
             .frame(width: gridIconSize, height: gridIconSize)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+            .background(AppTheme.paper.opacity(0.22), in: RoundedRectangle(cornerRadius: 16))
             Text(info.name.isEmpty ? "未命名文件夹" : info.name)
-                .font(.system(size: 12))
+                .font(.system(size: gridLabelFontSize))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(maxWidth: 100)
+                .frame(maxWidth: gridLabelWidth)
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 6)
         .background(
             RoundedRectangle(cornerRadius: 16)
-                .fill(Color.primary.opacity(info.id == state.highlightedAppID
-                                             ? 0.14
-                                             : hoveredEntryID == info.id ? 0.08 : 0))
+                .fill(info.id == state.highlightedAppID
+                      ? AppTheme.blue.opacity(0.34)
+                      : AppTheme.paper.opacity(hoveredEntryID == info.id ? 0.16 : 0))
         )
-        .scaleEffect(hoveredEntryID == info.id ? 1.035 : 1)
+        .scaleEffect(hoveredEntryID == info.id ? 1.015 : 1)
         .contentShape(Rectangle())
-        .onTapGesture { state.openFolderID = info.id }
+        .onTapGesture { state.openFolder(info.id) }
         .onHover { inside in
             guard !AppState.shared.isDragging else { return }
             hoveredEntryID = inside ? info.id : nil
         }
-        .animation(.easeOut(duration: 0.16), value: hoveredEntryID == info.id)
+        .animation(.easeOut(duration: 0.1), value: hoveredEntryID == info.id)
         .contextMenu { folderContextMenu(info) }
     }
 
@@ -640,7 +958,7 @@ struct ContentView: View {
         ZStack {
             Color.black.opacity(0.35)
                 .contentShape(Rectangle())
-                .onTapGesture { state.openFolderID = nil }   // 点击外部空白关闭
+                .onTapGesture { state.closeFolder() }   // 点击外部空白关闭
 
             VStack(spacing: 14) {
                 FolderTitleField(folderID: folderID)
@@ -665,7 +983,7 @@ struct ContentView: View {
 
                 Button("解散文件夹") {
                     store.dissolveFolder(folderID)
-                    state.openFolderID = nil
+                    state.closeFolder()
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 12))
@@ -717,7 +1035,7 @@ struct ContentView: View {
                 let didLeavePanel = folderPanelHidden
                 if didLeavePanel {
                     commitDrag()                     // 含 finishDrag(清 panel 状态)
-                    state.openFolderID = nil         // 拖出后关闭面板(可能已自动解散)
+                    state.closeFolder()              // 拖出后关闭面板(可能已自动解散)
                 } else {
                     // 未离开面板:无操作
                     AppState.shared.dragInhibited = false
@@ -727,7 +1045,7 @@ struct ContentView: View {
             }
     }
 
-    /// 文件夹标题:点击即改名(还原 LaunchOS:点展开后的标题重命名)。
+    /// 文件夹标题:点击即改名(还原 LaunchPoint:点展开后的标题重命名)。
     /// 回车或面板关闭(点外部/Esc)都会提交,不丢输入。
     private struct FolderTitleField: View {
         let folderID: String
@@ -783,6 +1101,7 @@ struct ContentView: View {
         guard !AppState.shared.dragInhibited else { return }   // 本次按住已被 Esc 取消
         if draggingEntry == nil {
             draggingEntry = entry
+            hoveredEntryID = nil
             AppState.shared.isDragging = true
             hasLeftOrigin = false
             // 记录起拖格:指针未离开它之前不判定任何落点("拿起放回"必须是无操作)
@@ -802,11 +1121,11 @@ struct ContentView: View {
     private func cellIndex(xInPage: CGFloat, y: CGFloat) -> Int? {
         let cols = LayoutStore.columns
         let colWidth = (containerWidth - 2 * Self.hPadding
-                        - CGFloat(cols - 1) * Self.colSpacing) / CGFloat(cols)
-        let pitch = colWidth + Self.colSpacing
+                        - CGFloat(cols - 1) * gridColumnSpacing) / CGFloat(cols)
+        let pitch = colWidth + gridColumnSpacing
         let col = Int(floor((xInPage - Self.hPadding) / pitch))
         guard col >= 0, col < cols else { return nil }
-        let rowPitch = cellHeight + gridRowSpacing
+        let rowPitch = gridCellHeight + gridRowSpacing
         let row = Int(floor((y - Self.gridTop) / rowPitch))
         guard row >= 0, row < LayoutStore.rows else { return nil }
         return row * cols + col
@@ -860,20 +1179,21 @@ struct ContentView: View {
     private func ontoHit(xInPage: CGFloat, y: CGFloat, entries: [PageEntry]) -> PageEntry? {
         let cols = LayoutStore.columns
         let colWidth = (containerWidth - 2 * Self.hPadding
-                        - CGFloat(cols - 1) * Self.colSpacing) / CGFloat(cols)
-        let pitch = colWidth + Self.colSpacing
+                        - CGFloat(cols - 1) * gridColumnSpacing) / CGFloat(cols)
+        let pitch = colWidth + gridColumnSpacing
         let xInGrid = xInPage - Self.hPadding
         let col = Int(floor(xInGrid / pitch))
         guard col >= 0, col < cols else { return nil }
         let fracX = xInGrid - CGFloat(col) * pitch
         guard fracX > colWidth * 0.22, fracX < colWidth * 0.78 else { return nil }
 
-        let rowPitch = cellHeight + gridRowSpacing
+        let rowPitch = gridCellHeight + gridRowSpacing
         let yInGrid = y - Self.gridTop
         let row = Int(floor(yInGrid / rowPitch))
         guard row >= 0, row < LayoutStore.rows else { return nil }
         let fracY = yInGrid - CGFloat(row) * rowPitch
-        guard fracY > cellHeight * 0.12, fracY < cellHeight * 0.88 else { return nil }
+        guard fracY > gridCellHeight * 0.12,
+              fracY < gridCellHeight * 0.88 else { return nil }
 
         let index = row * cols + col
         return index < entries.count ? entries[index] : nil
@@ -883,14 +1203,14 @@ struct ContentView: View {
     private func insertionSlot(xInPage: CGFloat, y: CGFloat) -> Int {
         let cols = LayoutStore.columns
         let colWidth = (containerWidth - 2 * Self.hPadding
-                        - CGFloat(cols - 1) * Self.colSpacing) / CGFloat(cols)
-        let pitch = colWidth + Self.colSpacing
+                        - CGFloat(cols - 1) * gridColumnSpacing) / CGFloat(cols)
+        let pitch = colWidth + gridColumnSpacing
 
         let xInGrid = xInPage - Self.hPadding
         var col = Int(floor((xInGrid - colWidth / 2) / pitch)) + 1
         col = min(max(col, 0), cols)
 
-        let rowPitch = cellHeight + gridRowSpacing
+        let rowPitch = gridCellHeight + gridRowSpacing
         var row = Int(floor((y - Self.gridTop) / rowPitch))
         row = min(max(row, 0), LayoutStore.rows - 1)
 
@@ -917,9 +1237,11 @@ struct ContentView: View {
                 i += 1
             }
         }
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-            previewPages = preview
-        }
+        // 指针移动会高频触发落点更新。这里直接提交预览，避免每一帧
+        // 启动一个尚未完成的 spring 动画，造成主线程队列堆积。
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { previewPages = preview }
     }
 
     /// 拖到页面左右边缘悬停 0.45s → 自动翻页;指针不动也会连续翻页并刷新落点。
@@ -986,9 +1308,9 @@ struct ContentView: View {
         folderPanelHidden = false
         AppState.shared.isDragging = false
         state.currentPage = min(state.currentPage, max(0, store.pages.count - 1))
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-            previewPages = nil
-        }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { previewPages = nil }
     }
 
     @ViewBuilder
@@ -1049,25 +1371,25 @@ struct ContentView: View {
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(maxWidth: max(92, gridIconSize * 1.4))
+                .frame(maxWidth: gridLabelWidth)
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 6)
         .background(
             // 键盘高亮:圆角浅底,与原生选中态一致
             RoundedRectangle(cornerRadius: 16)
-                .fill(Color.primary.opacity(app.id == state.highlightedAppID
-                                             ? 0.14
-                                             : hoveredEntryID == app.id ? 0.08 : 0))
+                .fill(app.id == state.highlightedAppID
+                      ? AppTheme.blue.opacity(0.34)
+                      : AppTheme.paper.opacity(hoveredEntryID == app.id ? 0.16 : 0))
         )
-        .scaleEffect(hoveredEntryID == app.id ? 1.035 : 1)
+        .scaleEffect(hoveredEntryID == app.id ? 1.015 : 1)
         .contentShape(Rectangle())
         .onTapGesture { launch(app) }
         .onHover { inside in
             guard !AppState.shared.isDragging else { return }
             hoveredEntryID = inside ? app.id : nil
         }
-        .animation(.easeOut(duration: 0.16), value: hoveredEntryID == app.id)
+        .animation(.easeOut(duration: 0.1), value: hoveredEntryID == app.id)
         .contextMenu { appContextMenu(app) }
     }
 
@@ -1078,13 +1400,18 @@ struct ContentView: View {
             ForEach(displayPages.indices, id: \.self) { index in
                 Circle()
                     .fill(index == state.currentPage
-                          ? Color.primary.opacity(0.85)
-                          : Color.primary.opacity(0.25))
+                          ? AppTheme.blue
+                          : AppTheme.paper.opacity(0.42))
                     .frame(width: 7, height: 7)
                     .contentShape(Circle().scale(2.2))   // 扩大点击热区
                     .onTapGesture {
                         state.highlightedAppID = nil     // 手动跳页,旧高亮失效
-                        state.currentPage = index
+                        guard index != state.currentPage else { return }
+                        withAnimation(.interactiveSpring(response: 0.29,
+                                                         dampingFraction: 0.92,
+                                                         blendDuration: 0.05)) {
+                            state.currentPage = index
+                        }
                     }
             }
         }
