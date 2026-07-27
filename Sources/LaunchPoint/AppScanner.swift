@@ -19,6 +19,7 @@ struct AppItem: Identifiable {
 /// Scans application directories for installed apps.
 enum AppScanner {
     private static let iconCache = NSCache<NSString, NSImage>()
+    private static let maximumSearchDepth = 5
 
     static let defaultSearchDirs: [String] = [
         "/Applications",
@@ -35,13 +36,28 @@ enum AppScanner {
         var seen = Set<String>()
         var items: [AppItem] = []
 
-        for dir in sources {
-            guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { continue }
-            for entry in entries where entry.hasSuffix(".app") {
-                let fullPath = dir + "/" + entry
+        for dir in compactSearchRoots(sources) {
+            let rootURL = URL(fileURLWithPath: dir, isDirectory: true)
+            guard let enumerator = fm.enumerator(
+                at: rootURL,
+                includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants],
+                errorHandler: { _, _ in true }
+            ) else { continue }
+
+            while let url = enumerator.nextObject() as? URL {
+                let isApplication = url.pathExtension.caseInsensitiveCompare("app") == .orderedSame
+                guard isApplication else {
+                    if enumerator.level >= maximumSearchDepth {
+                        enumerator.skipDescendants()
+                    }
+                    continue
+                }
+                enumerator.skipDescendants()
+
+                let fullPath = url.standardizedFileURL.path
                 guard seen.insert(fullPath).inserted else { continue }
-                let name = String(entry.dropLast(4))
-                let url = URL(fileURLWithPath: fullPath)
+                let name = url.deletingPathExtension().lastPathComponent
                 let cacheKey = fullPath as NSString
                 let icon: NSImage
                 if let cached = iconCache.object(forKey: cacheKey) {
@@ -65,5 +81,27 @@ enum AppScanner {
         return items.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
+    }
+
+    /// Drop duplicate roots and roots already covered by an enabled parent.
+    /// This keeps recursive scanning cheap when both /Applications and one of
+    /// its subdirectories are present in an older saved source list.
+    private static func compactSearchRoots(_ sources: [String]) -> [String] {
+        let roots = Set(sources.map {
+            URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath,
+                isDirectory: true).standardizedFileURL.path
+        }).sorted { lhs, rhs in
+            if lhs.count == rhs.count { return lhs < rhs }
+            return lhs.count < rhs.count
+        }
+
+        var result: [String] = []
+        for root in roots {
+            let covered = result.contains { parent in
+                root == parent || root.hasPrefix(parent.hasSuffix("/") ? parent : parent + "/")
+            }
+            if !covered { result.append(root) }
+        }
+        return result
     }
 }
