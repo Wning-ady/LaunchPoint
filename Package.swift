@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "LaunchpadClone",
+    name: "LaunchPoint",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "LaunchpadClone",
-            path: "Sources/LaunchpadClone"
+            name: "LaunchPoint",
+            path: "Sources/LaunchPoint"
         )
     ]
 )
