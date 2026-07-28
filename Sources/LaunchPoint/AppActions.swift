@@ -3,6 +3,20 @@ import AppKit
 /// 应用级操作:添加到程序坞、简介信息、卸载(含残留清理)。
 enum AppActions {
 
+    /// Opens app bundles normally. Standalone executable files are handed to
+    /// Terminal so shell scripts retain an interactive session for output and
+    /// privilege prompts instead of being treated as documents by Finder.
+    static func launch(_ url: URL) {
+        if url.pathExtension.caseInsensitiveCompare("app") == .orderedSame {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-a", "Terminal", "--", url.path]
+        try? task.run()
+    }
+
     // MARK: - 添加到程序坞
 
     /// 把应用加入 Dock 的 persistent-apps 并重启 Dock 生效。

@@ -143,6 +143,10 @@ extension Notification.Name {
     static let cancelDrag = Notification.Name("LaunchPointCancelDrag")
     /// 覆盖窗口切换显示器后刷新对应屏幕的桌面壁纸。
     static let launchPointScreenChanged = Notification.Name("LaunchPointScreenChanged")
+    /// Dock/Finder may launch a second accessory-process instance. It asks the
+    /// already-running instance to reveal the overlay through this process-wide
+    /// notification before the duplicate exits.
+    static let launchPointShowOverlayRequest = Notification.Name("LaunchPointShowOverlayRequest")
 }
 
 /// 无边框窗口默认不能成为 key window,覆盖后搜索框才能接收键盘输入。
@@ -190,6 +194,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var hotCornerArmed = true
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(showOverlayRequested(_:)),
+            name: .launchPointShowOverlayRequest,
+            object: nil
+        )
         guard claimPrimaryInstance() else { return }
         Settings.migrateLegacySpacingDefaultsIfNeeded()
         // 把持久化设置注入布局层(布局层不直接依赖设置层,便于独立测试)
@@ -220,6 +230,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return true
     }
 
+    @objc private func showOverlayRequested(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            self?.showOverlay()
+        }
+    }
+
     /// 同一 bundle 标识只保留一个全屏覆盖窗口。重复打开时把焦点交还既有实例，
     /// 避免多个透明窗口互相抢占鼠标、滚轮和全局快捷键。
     private func claimPrimaryInstance() -> Bool {
@@ -228,6 +244,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let running = NSWorkspace.shared.runningApplications.first(where: {
             $0.bundleIdentifier == bundleID && $0.processIdentifier != currentPID
         }) {
+            DistributedNotificationCenter.default().postNotificationName(
+                .launchPointShowOverlayRequest,
+                object: bundleID,
+                userInfo: nil,
+                deliverImmediately: true
+            )
             running.activate(options: [.activateAllWindows])
             NSApp.terminate(nil)
             return false
@@ -519,7 +541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     return nil
                 }
                 if let app = LayoutStore.shared.items.first(where: { $0.id == id }) {
-                    NSWorkspace.shared.open(app.url)
+                    AppActions.launch(app.url)
                     self?.dismissOverlay()
                     return nil
                 }

@@ -29,12 +29,38 @@ enum AppScanner {
         (("~/Applications") as NSString).expandingTildeInPath,
     ]
 
-    /// Returns every `.app` found in the given source directories, sorted by name.
-    static func scan(sources: [String] = defaultSearchDirs) -> [AppItem] {
+    /// Returns app bundles plus explicitly selected executables, sorted by name.
+    static func scan(sources: [String] = defaultSearchDirs,
+                     customPaths: [String] = []) -> [AppItem] {
         let fm = FileManager.default
         let workspace = NSWorkspace.shared
         var seen = Set<String>()
         var items: [AppItem] = []
+
+        func appendItem(_ url: URL) {
+            let normalizedURL = url.standardizedFileURL
+            let fullPath = normalizedURL.path
+            guard seen.insert(fullPath).inserted else { return }
+
+            let name = normalizedURL.deletingPathExtension().lastPathComponent
+            let cacheKey = fullPath as NSString
+            let icon: NSImage
+            if let cached = iconCache.object(forKey: cacheKey) {
+                icon = cached
+            } else {
+                icon = workspace.icon(forFile: fullPath)
+                icon.size = NSSize(width: 160, height: 160)
+                iconCache.setObject(icon, forKey: cacheKey)
+            }
+            items.append(
+                AppItem(id: fullPath,
+                        name: name,
+                        url: normalizedURL,
+                        icon: icon,
+                        bundleID: Bundle(url: normalizedURL)?.bundleIdentifier,
+                        alias: nil)
+            )
+        }
 
         for dir in compactSearchRoots(sources) {
             let rootURL = URL(fileURLWithPath: dir, isDirectory: true)
@@ -47,40 +73,43 @@ enum AppScanner {
 
             while let url = enumerator.nextObject() as? URL {
                 let isApplication = url.pathExtension.caseInsensitiveCompare("app") == .orderedSame
-                guard isApplication else {
-                    if enumerator.level >= maximumSearchDepth {
-                        enumerator.skipDescendants()
-                    }
+                if isApplication {
+                    enumerator.skipDescendants()
+                    appendItem(url)
                     continue
                 }
-                enumerator.skipDescendants()
 
-                let fullPath = url.standardizedFileURL.path
-                guard seen.insert(fullPath).inserted else { continue }
-                let name = url.deletingPathExtension().lastPathComponent
-                let cacheKey = fullPath as NSString
-                let icon: NSImage
-                if let cached = iconCache.object(forKey: cacheKey) {
-                    icon = cached
-                } else {
-                    icon = workspace.icon(forFile: fullPath)
-                    icon.size = NSSize(width: 160, height: 160)
-                    iconCache.setObject(icon, forKey: cacheKey)
+                // A few utility apps, including Adobe maintenance scripts, are
+                // installed as executable files directly in /Applications.
+                if url.deletingLastPathComponent().standardizedFileURL == rootURL.standardizedFileURL,
+                   isLaunchable(url) {
+                    appendItem(url)
                 }
-                items.append(
-                    AppItem(id: fullPath,
-                            name: name,
-                            url: url,
-                            icon: icon,
-                            bundleID: Bundle(url: url)?.bundleIdentifier,
-                            alias: nil)
-                )
+                if enumerator.level >= maximumSearchDepth {
+                    enumerator.skipDescendants()
+                }
             }
+        }
+
+        for path in customPaths {
+            let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            if isLaunchable(url) { appendItem(url) }
         }
 
         return items.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
+    }
+
+    static func isLaunchable(_ url: URL) -> Bool {
+        if url.pathExtension.caseInsensitiveCompare("app") == .orderedSame {
+            return FileManager.default.fileExists(atPath: url.path)
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            return false
+        }
+        return !isDirectory.boolValue && FileManager.default.isExecutableFile(atPath: url.path)
     }
 
     /// Drop duplicate roots and roots already covered by an enabled parent.

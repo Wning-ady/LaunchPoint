@@ -298,6 +298,8 @@ struct SettingsPanel: View {
     @State private var dataMessage: String?
     @State private var sources = LayoutStore.shared.sourceRecords()
     @State private var showSourceImporter = false
+    @State private var customApps = LayoutStore.shared.customAppPaths()
+    @State private var showProgramImporter = false
     @State private var isHoveringTitleBar = false
     @StateObject private var updateChecker = UpdateChecker()
     @State private var gridCommitWork: DispatchWorkItem?
@@ -449,6 +451,25 @@ struct SettingsPanel: View {
                 sources = LayoutStore.shared.sourceRecords()
             case .failure(let error):
                 dataMessage = "添加应用来源失败：\(error.localizedDescription)"
+            }
+        }
+        .fileImporter(isPresented: $showProgramImporter,
+                      allowedContentTypes: [.application, .unixExecutable],
+                      allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls):
+                var added = 0
+                for url in urls {
+                    let accessed = url.startAccessingSecurityScopedResource()
+                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                    if LayoutStore.shared.addCustomApp(path: url.path) { added += 1 }
+                }
+                customApps = LayoutStore.shared.customAppPaths()
+                if added == 0 {
+                    dataMessage = "请选择应用包或可执行文件。"
+                }
+            case .failure(let error):
+                dataMessage = "添加程序失败：\(error.localizedDescription)"
             }
         }
     }
@@ -895,6 +916,58 @@ struct SettingsPanel: View {
             Text("停用来源不会删除已有布局，只会停止扫描该目录中的应用。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            Divider().padding(.vertical, 2)
+
+            HStack {
+                Text("手动添加程序")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                Button {
+                    showProgramImporter = true
+                } label: {
+                    Label("添加", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+            }
+
+            settingCard {
+                if customApps.isEmpty {
+                    Text("可添加任意应用包或可执行文件。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                ForEach(customApps, id: \.self) { path in
+                    HStack(spacing: 10) {
+                        Image(systemName: "terminal")
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent)
+                                .font(.body.weight(.medium))
+                                .lineLimit(1)
+                            Text(path)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 8)
+                        Button {
+                            LayoutStore.shared.removeCustomApp(path: path)
+                            customApps = LayoutStore.shared.customAppPaths()
+                        } label: {
+                            Image(systemName: "minus.circle")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .help("移除程序")
+                    }
+                    if path != customApps.last {
+                        Divider()
+                    }
+                }
+            }
             Spacer()
         }
     }
