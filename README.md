@@ -11,9 +11,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.0/LaunchPoint-v0.1.0-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
+  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.1/LaunchPoint-v0.1.1-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
   ·
-  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.0/LaunchPoint-v0.1.0-x86_64.dmg"><strong>Intel 下载</strong></a>
+  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.1/LaunchPoint-v0.1.1-x86_64.dmg"><strong>Intel 下载</strong></a>
   ·
   <a href="https://github.com/Wning-ady/LaunchPoint/releases">全部发行版</a>
   ·
@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  macOS 14+ · Swift 6 · MIT License · 当前版本 v0.1.0
+  macOS 14+ · Swift 6 · MIT License · 当前版本 v0.1.1
 </p>
 
 ## 简介
@@ -64,8 +64,8 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 
 | Mac | 安装包 |
 | --- | --- |
-| Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.0/LaunchPoint-v0.1.0-arm64.dmg) |
-| Intel | [下载 x86_64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.0/LaunchPoint-v0.1.0-x86_64.dmg) |
+| Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.1/LaunchPoint-v0.1.1-arm64.dmg) |
+| Intel | [下载 x86_64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.1/LaunchPoint-v0.1.1-x86_64.dmg) |
 
 1. 打开与你的 Mac 匹配的 DMG。
 2. 将 `LaunchPoint.app` 拖入 `Applications`。
@@ -86,8 +86,8 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 ```text
 dist/LaunchPoint-arm64.app
 dist/LaunchPoint-x86_64.app
-dist/LaunchPoint-v0.1.0-arm64.dmg
-dist/LaunchPoint-v0.1.0-x86_64.dmg
+dist/LaunchPoint-v0.1.1-arm64.dmg
+dist/LaunchPoint-v0.1.1-x86_64.dmg
 ```
 
 严格类型检查：

@@ -35,12 +35,37 @@ struct Layout: Codable {
     var groups: [GroupRecord]
     var apps: [AppRecord]
     var sources: [SourceRecord]
+    var customApps: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case version, groups, apps, sources, customApps
+    }
+
+    init(version: Int, groups: [GroupRecord], apps: [AppRecord],
+         sources: [SourceRecord], customApps: [String] = []) {
+        self.version = version
+        self.groups = groups
+        self.apps = apps
+        self.sources = sources
+        self.customApps = customApps
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(Int.self, forKey: .version)
+        groups = try container.decode([GroupRecord].self, forKey: .groups)
+        apps = try container.decode([AppRecord].self, forKey: .apps)
+        sources = try container.decodeIfPresent([SourceRecord].self, forKey: .sources)
+            ?? AppScanner.defaultSearchDirs.map { SourceRecord(path: $0, enabled: true) }
+        customApps = try container.decodeIfPresent([String].self, forKey: .customApps) ?? []
+    }
 
     static func initial() -> Layout {
         Layout(version: 1,
                groups: [GroupRecord(id: "page-0", isFolder: false, name: nil, page: 0, order: 0)],
                apps: [],
-               sources: AppScanner.defaultSearchDirs.map { SourceRecord(path: $0, enabled: true) })
+               sources: AppScanner.defaultSearchDirs.map { SourceRecord(path: $0, enabled: true) },
+               customApps: [])
     }
 }
 
@@ -107,11 +132,16 @@ final class LayoutStore: ObservableObject {
     private var scannedByPath: [String: AppItem] = [:]
     private var refreshGeneration = 0
     private var refreshInFlight = false
-    private var refreshSources: [String] = []
-    private var pendingRefresh: (generation: Int, sources: [String])?
+    private var refreshRequest: ScanRequest?
+    private var pendingRefresh: (generation: Int, request: ScanRequest)?
     private var pendingSave: DispatchWorkItem?
     private let scanQueue = DispatchQueue(label: "LaunchPoint.application-scan",
                                           qos: .userInitiated)
+
+    private struct ScanRequest: Equatable {
+        let sources: [String]
+        let customApps: [String]
+    }
 
     private static let fileURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory,
@@ -137,26 +167,28 @@ final class LayoutStore: ObservableObject {
 
     /// 后台扫描应用目录，避免启动台首次出现时阻塞主线程。
     func refreshAsync() {
-        refreshGeneration &+= 1
-        let generation = refreshGeneration
-        let sources = layout.sources.filter(\.enabled).map(\.path)
+        let request = ScanRequest(sources: layout.sources.filter(\.enabled).map(\.path),
+                                  customApps: layout.customApps)
 
         // 多个唤起通知可能在数百毫秒内连续到达。同一来源扫描正在进行时
         // 直接复用它，来源变更则只保留最后一次请求，避免并发解码全部应用图标。
         if refreshInFlight {
-            if sources != refreshSources {
-                pendingRefresh = (generation, sources)
-            }
+            guard request != refreshRequest else { return }
+            refreshGeneration &+= 1
+            pendingRefresh = (refreshGeneration, request)
             return
         }
-        startAsyncRefresh(generation: generation, sources: sources)
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        startAsyncRefresh(generation: generation, request: request)
     }
 
-    private func startAsyncRefresh(generation: Int, sources: [String]) {
+    private func startAsyncRefresh(generation: Int, request: ScanRequest) {
         refreshInFlight = true
-        refreshSources = sources
+        refreshRequest = request
         scanQueue.async { [weak self] in
-            let scanned = AppScanner.scan(sources: sources)
+            let scanned = AppScanner.scan(sources: request.sources,
+                                          customPaths: request.customApps)
             DispatchQueue.main.async {
                 guard let self else { return }
                 if self.refreshGeneration == generation {
@@ -168,11 +200,11 @@ final class LayoutStore: ObservableObject {
                     }
                 }
                 self.refreshInFlight = false
-                self.refreshSources = []
+                self.refreshRequest = nil
                 if let pending = self.pendingRefresh {
                     self.pendingRefresh = nil
                     self.startAsyncRefresh(generation: pending.generation,
-                                           sources: pending.sources)
+                                           request: pending.request)
                 }
             }
         }
@@ -183,7 +215,8 @@ final class LayoutStore: ObservableObject {
         scannedByPath = byPath
 
         // 1. 移除已卸载的应用
-        layout.apps.removeAll { byPath[$0.id] == nil }
+        let manualIDs = Set(layout.customApps)
+        layout.apps.removeAll { byPath[$0.id] == nil && !manualIDs.contains($0.id) }
 
         // 2. 新安装的应用追加到最后一页队尾(首次运行 = 全部按扫描的字母序录入)
         let known = Set(layout.apps.map(\.id))
@@ -418,6 +451,30 @@ final class LayoutStore: ObservableObject {
     /// 删除自定义应用来源。默认来源也允许移除，便于用户精简扫描范围。
     func removeSource(path: String) {
         layout.sources.removeAll { $0.path == path }
+        save()
+        refreshAsync()
+    }
+
+    /// Manually selected app bundles and executable files remain discoverable
+    /// even when they live outside configured scan folders.
+    func customAppPaths() -> [String] {
+        layout.customApps
+    }
+
+    @discardableResult
+    func addCustomApp(path: String) -> Bool {
+        let normalized = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            .standardizedFileURL.path
+        guard AppScanner.isLaunchable(URL(fileURLWithPath: normalized)),
+              !layout.customApps.contains(normalized) else { return false }
+        layout.customApps.append(normalized)
+        save()
+        refreshAsync()
+        return true
+    }
+
+    func removeCustomApp(path: String) {
+        layout.customApps.removeAll { $0 == path }
         save()
         refreshAsync()
     }

@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import ImageIO
 import QuartzCore
+import UniformTypeIdentifiers
 
 /// 使用 AppKit 视觉效果承载窗口级毛玻璃，避免 SwiftUI material 被透明窗口裁剪。
 private struct VisualEffectBackground: NSViewRepresentable {
@@ -177,6 +178,8 @@ struct ContentView: View {
     @State private var wallpaperGeneration = 0
     @State private var wallpaperCacheKey = ""
     @State private var wallpaperPendingKey = ""
+    @State private var showProgramImporter = false
+    @State private var programImportError: String?
 
     // MARK: 网格几何常量(与 pageView 布局参数保持一致)
     private static let hPadding: CGFloat = 70
@@ -438,6 +441,32 @@ struct ContentView: View {
         }
         .onChange(of: state.gridColumns) { _, _ in clampPreviewPage() }
         .onChange(of: state.gridRows) { _, _ in clampPreviewPage() }
+        .fileImporter(isPresented: $showProgramImporter,
+                      allowedContentTypes: [.application, .unixExecutable],
+                      allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls):
+                var added = 0
+                for url in urls {
+                    let accessed = url.startAccessingSecurityScopedResource()
+                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                    if store.addCustomApp(path: url.path) { added += 1 }
+                }
+                if added == 0 {
+                    programImportError = "请选择尚未添加的应用包或可执行文件。"
+                }
+            case .failure(let error):
+                programImportError = "添加程序失败：\(error.localizedDescription)"
+            }
+        }
+        .alert("添加程序", isPresented: Binding(
+            get: { programImportError != nil },
+            set: { if !$0 { programImportError = nil } }
+        )) {
+            Button("好", role: .cancel) { programImportError = nil }
+        } message: {
+            Text(programImportError ?? "")
+        }
     }
 
     private func clampPreviewPage() {
@@ -765,6 +794,9 @@ struct ContentView: View {
         }
         Button("重新扫描应用") {
             store.refreshAsync()
+        }
+        Button("添加程序…") {
+            showProgramImporter = true
         }
         Divider()
         Button("设置…") {
@@ -1837,7 +1869,7 @@ struct ContentView: View {
     }
 
     private func launch(_ app: AppItem) {
-        NSWorkspace.shared.open(app.url)
+        AppActions.launch(app.url)
         dismiss()
     }
 }
