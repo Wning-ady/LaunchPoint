@@ -1,4 +1,5 @@
 import Combine
+import AppKit
 import Foundation
 
 struct UpdateRelease: Equatable, Sendable {
@@ -70,6 +71,8 @@ final class UpdateChecker: ObservableObject {
     enum State: Equatable {
         case idle
         case checking
+        case downloading(version: String)
+        case installing(version: String)
         case upToDate(latestVersion: String)
         case updateAvailable(UpdateRelease)
         case failed(message: String)
@@ -83,6 +86,7 @@ final class UpdateChecker: ObservableObject {
     let currentVersion: String
     private let endpoint: URL
     private var checkTask: Task<Void, Never>?
+    private var installTask: Task<Void, Never>?
     private var generation = 0
 
     init(
@@ -102,6 +106,15 @@ final class UpdateChecker: ObservableObject {
 
     var preferredDownloadURL: URL? {
         availableRelease?.preferredDMG()?.downloadURL
+    }
+
+    var isBusy: Bool {
+        switch state {
+        case .checking, .downloading, .installing:
+            return true
+        case .idle, .upToDate, .updateAvailable, .failed:
+            return false
+        }
     }
 
     func checkForUpdates() {
@@ -127,11 +140,48 @@ final class UpdateChecker: ObservableObject {
         }
     }
 
+    func installAvailableUpdate() {
+        guard let release = availableRelease else { return }
+        install(release)
+    }
+
+    private func install(_ release: UpdateRelease) {
+        installTask?.cancel()
+        generation &+= 1
+        let requestGeneration = generation
+        state = .downloading(version: release.version)
+
+        installTask = Task { [weak self] in
+            do {
+                let prepared = try await Task.detached(priority: .userInitiated) {
+                    try await Self.prepareInstall(for: release)
+                }.value
+                try Task.checkCancellation()
+                guard let self, requestGeneration == self.generation else { return }
+                self.state = .installing(version: release.version)
+                try Self.launchInstaller(prepared)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                    NSApp.terminate(nil)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, requestGeneration == self.generation else { return }
+                self.state = .failed(message: Self.userFacingMessage(for: error))
+            }
+        }
+    }
+
     func cancel() {
+        if case .installing = state { return }
         generation &+= 1
         checkTask?.cancel()
+        installTask?.cancel()
         checkTask = nil
+        installTask = nil
         if case .checking = state {
+            state = .idle
+        } else if case .downloading = state {
             state = .idle
         }
     }
@@ -212,8 +262,204 @@ final class UpdateChecker: ObservableObject {
                 return "检查更新失败（HTTP \(status)）。"
             }
         }
+        if let installError = error as? UpdateInstallError {
+            return installError.localizedDescription
+        }
         return "检查更新失败：\(error.localizedDescription)"
     }
+
+    private nonisolated static func prepareInstall(for release: UpdateRelease) async throws -> PreparedInstall {
+        guard let asset = release.preferredDMG() else {
+            throw UpdateInstallError.missingCompatibleDMG
+        }
+
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(
+            "LaunchPointUpdate-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        do {
+            var request = URLRequest(url: asset.downloadURL)
+            request.timeoutInterval = 60
+            request.setValue("LaunchPoint-Updater", forHTTPHeaderField: "User-Agent")
+            let (downloadedURL, response) = try await URLSession.shared.download(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200..<300).contains(httpResponse.statusCode) else {
+                throw UpdateInstallError.downloadFailed
+            }
+
+            let dmgURL = tempDir.appendingPathComponent(asset.name)
+            if fm.fileExists(atPath: dmgURL.path) {
+                try fm.removeItem(at: dmgURL)
+            }
+            try fm.moveItem(at: downloadedURL, to: dmgURL)
+
+            let mountPoint = try mountDiskImage(dmgURL)
+            let sourceApp = try findLaunchPointApp(in: mountPoint)
+            let expectedBundleID = Bundle.main.bundleIdentifier ?? "com.waning.launchpoint"
+            guard Bundle(url: sourceApp)?.bundleIdentifier == expectedBundleID else {
+                throw UpdateInstallError.invalidBundle
+            }
+
+            return PreparedInstall(sourceApp: sourceApp,
+                                   targetApp: installTargetURL(),
+                                   mountPoint: mountPoint,
+                                   temporaryDirectory: tempDir,
+                                   currentPID: ProcessInfo.processInfo.processIdentifier)
+        } catch {
+            try? fm.removeItem(at: tempDir)
+            throw error
+        }
+    }
+
+    private nonisolated static func installTargetURL() -> URL {
+        let currentBundle = Bundle.main.bundleURL.standardizedFileURL
+        if currentBundle.pathExtension.caseInsensitiveCompare("app") == .orderedSame,
+           !currentBundle.path.hasPrefix("/Volumes/") {
+            return currentBundle
+        }
+        return URL(fileURLWithPath: "/Applications/LaunchPoint.app", isDirectory: true)
+    }
+
+    private nonisolated static func mountDiskImage(_ dmgURL: URL) throws -> URL {
+        let output = try runProcess(
+            executable: "/usr/bin/hdiutil",
+            arguments: ["attach", "-nobrowse", "-readonly", "-plist", dmgURL.path]
+        )
+        guard let plist = try PropertyListSerialization.propertyList(
+            from: output.standardOutput,
+            options: [],
+            format: nil
+        ) as? [String: Any],
+              let entities = plist["system-entities"] as? [[String: Any]] else {
+            throw UpdateInstallError.mountFailed
+        }
+        for entity in entities {
+            if let mountPath = entity["mount-point"] as? String, !mountPath.isEmpty {
+                return URL(fileURLWithPath: mountPath, isDirectory: true)
+            }
+        }
+        throw UpdateInstallError.mountFailed
+    }
+
+    private nonisolated static func findLaunchPointApp(in mountPoint: URL) throws -> URL {
+        let direct = mountPoint.appendingPathComponent("LaunchPoint.app", isDirectory: true)
+        if FileManager.default.fileExists(atPath: direct.path) { return direct }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: mountPoint,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            throw UpdateInstallError.missingAppInDMG
+        }
+
+        for case let url as URL in enumerator {
+            guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame else { continue }
+            if url.deletingPathExtension().lastPathComponent == "LaunchPoint" {
+                return url
+            }
+        }
+        throw UpdateInstallError.missingAppInDMG
+    }
+
+    private nonisolated static func launchInstaller(_ install: PreparedInstall) throws {
+        let script = """
+        target="$1"
+        source="$2"
+        mount="$3"
+        temp="$4"
+        oldpid="$5"
+        while /bin/kill -0 "$oldpid" 2>/dev/null; do
+          /bin/sleep 0.1
+        done
+        backup="${target}.previous"
+        /bin/rm -rf "$backup"
+        backup_moved=0
+        if [ -d "$target" ]; then
+          if /bin/mv "$target" "$backup"; then
+            backup_moved=1
+          fi
+        fi
+        if /usr/bin/ditto "$source" "$target"; then
+          /usr/bin/xattr -dr com.apple.quarantine "$target" >/dev/null 2>&1 || true
+          /bin/rm -rf "$backup"
+          /usr/bin/open "$target"
+          status=0
+        else
+          status=$?
+          /bin/rm -rf "$target"
+          if [ "$backup_moved" -eq 1 ]; then
+            /bin/mv "$backup" "$target"
+          fi
+          if [ -d "$target" ]; then
+            /usr/bin/open "$target"
+          fi
+        fi
+        /usr/bin/hdiutil detach "$mount" -quiet >/dev/null 2>&1 || true
+        /bin/rm -rf "$temp"
+        exit "$status"
+        """
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c",
+            script,
+            "launchpoint-updater",
+            install.targetApp.path,
+            install.sourceApp.path,
+            install.mountPoint.path,
+            install.temporaryDirectory.path,
+            "\(install.currentPID)",
+        ]
+        do {
+            try process.run()
+        } catch {
+            throw UpdateInstallError.installerLaunchFailed
+        }
+    }
+
+    @discardableResult
+    private nonisolated static func runProcess(executable: String,
+                                               arguments: [String]) throws -> ProcessOutput {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        do {
+            try process.run()
+        } catch {
+            throw UpdateInstallError.processFailed(executable)
+        }
+        process.waitUntilExit()
+        let output = ProcessOutput(
+            standardOutput: stdout.fileHandleForReading.readDataToEndOfFile(),
+            standardError: stderr.fileHandleForReading.readDataToEndOfFile()
+        )
+        guard process.terminationStatus == 0 else {
+            throw UpdateInstallError.processFailed(executable)
+        }
+        return output
+    }
+}
+
+private struct PreparedInstall: Sendable {
+    let sourceApp: URL
+    let targetApp: URL
+    let mountPoint: URL
+    let temporaryDirectory: URL
+    let currentPID: pid_t
+}
+
+private struct ProcessOutput: Sendable {
+    let standardOutput: Data
+    let standardError: Data
 }
 
 private struct GitHubRelease: Decodable, Sendable {
@@ -247,6 +493,35 @@ private struct GitHubRelease: Decodable, Sendable {
 private enum UpdateCheckError: Error {
     case invalidResponse
     case httpStatus(Int)
+}
+
+private enum UpdateInstallError: LocalizedError {
+    case missingCompatibleDMG
+    case downloadFailed
+    case mountFailed
+    case missingAppInDMG
+    case invalidBundle
+    case installerLaunchFailed
+    case processFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingCompatibleDMG:
+            return "这个发行版没有匹配当前 Mac 架构的 DMG。"
+        case .downloadFailed:
+            return "下载更新包失败，请稍后重试。"
+        case .mountFailed:
+            return "无法挂载更新包 DMG。"
+        case .missingAppInDMG:
+            return "更新包里没有找到 LaunchPoint.app。"
+        case .invalidBundle:
+            return "更新包不是有效的 LaunchPoint 应用。"
+        case .installerLaunchFailed:
+            return "无法启动自动安装进程。"
+        case .processFailed(let executable):
+            return "\(URL(fileURLWithPath: executable).lastPathComponent) 执行失败。"
+        }
+    }
 }
 
 private struct SemanticVersion: Comparable, Sendable {

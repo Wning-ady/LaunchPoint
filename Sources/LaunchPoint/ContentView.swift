@@ -180,6 +180,7 @@ struct ContentView: View {
     @State private var wallpaperPendingKey = ""
     @State private var showProgramImporter = false
     @State private var programImportError: String?
+    @State private var launchingAppName: String?
 
     // MARK: 网格几何常量(与 pageView 布局参数保持一致)
     private static let hPadding: CGFloat = 70
@@ -411,6 +412,13 @@ struct ContentView: View {
             mainContent
                 .allowsHitTesting(!state.showSettings)
 
+            if store.isRefreshing || launchingAppName != nil {
+                activityPill
+                    .allowsHitTesting(false)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                    .zIndex(40)
+            }
+
             // 文件夹展开面板(盖在网格之上;拖出时隐去但视图保留,手势不断)
             if let folderID = state.openFolderID {
                 folderOverlay(folderID)
@@ -634,6 +642,28 @@ struct ContentView: View {
         dismiss()
     }
 
+    private var activityPill: some View {
+        VStack {
+            Spacer()
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(AppTheme.blue)
+                Text(launchingAppName.map { "正在打开 \($0)" } ?? "正在更新应用")
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(AppTheme.charcoal)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .background(AppTheme.paper.opacity(0.92), in: Capsule())
+            .overlay(Capsule().stroke(AppTheme.separator, lineWidth: 1))
+            .shadow(color: .black.opacity(0.18), radius: 14, y: 6)
+            .padding(.bottom, 54)
+        }
+        .animation(.easeOut(duration: 0.16), value: store.isRefreshing)
+        .animation(.easeOut(duration: 0.16), value: launchingAppName)
+    }
+
     @ViewBuilder
     private var overlayBackground: some View {
         if state.backgroundStyle == .wallpaper, let image = wallpaperImage {
@@ -805,6 +835,9 @@ struct ContentView: View {
         Divider()
         Button("完全退出") {
             NSApp.terminate(nil)
+        }
+        Button("退出并关闭开机启动") {
+            (NSApp.delegate as? AppDelegate)?.performStopBackgroundAndQuit()
         }
     }
 
@@ -1869,8 +1902,14 @@ struct ContentView: View {
     }
 
     private func launch(_ app: AppItem) {
+        withAnimation(.easeOut(duration: 0.12)) {
+            launchingAppName = app.displayName
+        }
         AppActions.launch(app.url)
-        dismiss()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
+            dismiss()
+            launchingAppName = nil
+        }
     }
 }
 

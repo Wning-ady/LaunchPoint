@@ -125,6 +125,8 @@ final class LayoutStore: ObservableObject {
     @Published private(set) var items: [AppItem] = []
     /// 分页展示列表:应用与文件夹图块混排,每页最多 capacity 个条目。
     @Published private(set) var pages: [[PageEntry]] = []
+    /// 应用目录正在后台扫描。旧页面会继续显示，只用轻量状态给用户反馈。
+    @Published private(set) var isRefreshing = false
 
     private var layout: Layout
 
@@ -176,6 +178,7 @@ final class LayoutStore: ObservableObject {
             guard request != refreshRequest else { return }
             refreshGeneration &+= 1
             pendingRefresh = (refreshGeneration, request)
+            isRefreshing = true
             return
         }
         refreshGeneration &+= 1
@@ -186,6 +189,7 @@ final class LayoutStore: ObservableObject {
     private func startAsyncRefresh(generation: Int, request: ScanRequest) {
         refreshInFlight = true
         refreshRequest = request
+        isRefreshing = true
         scanQueue.async { [weak self] in
             let scanned = AppScanner.scan(sources: request.sources,
                                           customPaths: request.customApps)
@@ -205,6 +209,8 @@ final class LayoutStore: ObservableObject {
                     self.pendingRefresh = nil
                     self.startAsyncRefresh(generation: pending.generation,
                                            request: pending.request)
+                } else {
+                    self.isRefreshing = false
                 }
             }
         }
@@ -217,6 +223,14 @@ final class LayoutStore: ObservableObject {
         // 1. 移除已卸载的应用
         let manualIDs = Set(layout.customApps)
         layout.apps.removeAll { byPath[$0.id] == nil && !manualIDs.contains($0.id) }
+
+        // 1.5. Refresh metadata for already-known apps. Aliases remain intact,
+        // while default names can follow the current system language.
+        for index in layout.apps.indices {
+            guard let item = byPath[layout.apps[index].id] else { continue }
+            layout.apps[index].name = item.name
+            layout.apps[index].bundleID = item.bundleID
+        }
 
         // 2. 新安装的应用追加到最后一页队尾(首次运行 = 全部按扫描的字母序录入)
         let known = Set(layout.apps.map(\.id))
