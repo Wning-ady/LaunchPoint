@@ -8,7 +8,11 @@ enum AppActions {
     /// privilege prompts instead of being treated as documents by Finder.
     static func launch(_ url: URL) {
         if url.pathExtension.caseInsensitiveCompare("app") == .orderedSame {
-            NSWorkspace.shared.open(url)
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.openApplication(at: url,
+                                               configuration: configuration,
+                                               completionHandler: nil)
             return
         }
         let task = Process()

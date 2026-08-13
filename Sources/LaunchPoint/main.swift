@@ -12,6 +12,13 @@ enum LaunchPointPhase {
     case dragging
 }
 
+enum TrackpadMonitorStatus: Equatable {
+    case inactive
+    case connecting
+    case connected(fingerCount: Int)
+    case unavailable
+}
+
 /// 全局共享状态,让 AppKit 层(按键/滚轮监听)与 SwiftUI 层互通。
 final class AppState: ObservableObject {
     static let shared = AppState()
@@ -44,6 +51,11 @@ final class AppState: ObservableObject {
     @Published var iconScale = Settings.iconScale
     @Published var horizontalSpacing = Settings.horizontalSpacing
     @Published var verticalSpacing = Settings.verticalSpacing
+    @Published var trackpadMonitorStatus: TrackpadMonitorStatus = .inactive
+    @Published var rawTrackpadContactCount = 0
+    @Published var rawTrackpadPinchProgress = 0.0
+    @Published var rawTrackpadTriggerCount = 0
+    @Published var rawTrackpadLastTriggerAt: Date?
 
     func enterSettings() {
         withAnimation(.easeOut(duration: 0.16)) {
@@ -191,7 +203,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var f4HotKeyRef: EventHotKeyRef?
     private var globalMouseMonitor: Any?
     private var localMouseMonitor: Any?
+    private var globalTrackpadMonitor: Any?
     private var hotCornerArmed = true
+    private var trackpadWakeAccumulatedDistance: CGFloat = 0
+    private var trackpadWakeDirection: CGFloat = 0
+    private var trackpadWakeLastTimestamp: TimeInterval = 0
+    private var trackpadWakeCooldownUntil: TimeInterval = 0
+    private var overlayAnimationGeneration = 0
+    private var installationMonitor: DispatchSourceTimer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DistributedNotificationCenter.default().addObserver(
@@ -211,6 +230,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         setUpKeyMonitor()
         setUpMouseUpMonitor()
         setUpHotCornerMonitor()
+        setUpTrackpadWakeMonitor()
+        setUpInstallationMonitor()
         NotificationCenter.default.addObserver(self,
                                                selector: #selector(screenParametersChanged),
                                                name: NSApplication.didChangeScreenParametersNotification,
@@ -221,7 +242,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             name: NSWorkspace.activeSpaceDidChangeNotification,
             object: nil
         )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
         showOverlay()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        installationMonitor?.cancel()
+        installationMonitor = nil
+        RawTrackpadMonitor.shared.stop()
+        if let globalTrackpadMonitor {
+            NSEvent.removeMonitor(globalTrackpadMonitor)
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication,
@@ -290,14 +326,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 唤起:清空上次搜索与高亮、置顶显示、聚焦搜索框。
     func showOverlay() {
         guard let window else { return }
+        overlayAnimationGeneration &+= 1
+        let wasVisible = window.isVisible
         let targetFrame = selectedScreen().frame
         if window.frame != targetFrame { window.setFrame(targetFrame, display: false) }
         AppState.shared.query = ""
         AppState.shared.highlightedAppID = nil
         AppState.shared.openFolderID = nil
         AppState.shared.setOverlayVisible(true)
+        window.contentView?.wantsLayer = true
+        if !wasVisible {
+            window.alphaValue = 0
+        }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.20
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().alphaValue = 1
+        }
+        animateOverlayScale(to: 1, fallbackFrom: wasVisible ? 0.96 : 0.94,
+                            duration: 0.22, timing: .easeOut)
         NotificationCenter.default.post(name: .launchPointScreenChanged, object: nil)
         NotificationCenter.default.post(name: .refocusSearch, object: nil)
     }
@@ -308,9 +357,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             AppState.shared.dragInhibited = true
             NotificationCenter.default.post(name: .cancelDrag, object: nil)
         }
-        window?.orderOut(nil)
+        guard let window, window.isVisible else { return }
+        overlayAnimationGeneration &+= 1
+        let generation = overlayAnimationGeneration
         AppState.shared.setOverlayVisible(false)
-        NSApp.deactivate()
+        window.contentView?.wantsLayer = true
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.17
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            window.animator().alphaValue = 0
+        } completionHandler: { [weak self, weak window] in
+            DispatchQueue.main.async {
+                guard let self, self.overlayAnimationGeneration == generation else { return }
+                window?.orderOut(nil)
+                window?.alphaValue = 1
+                window?.contentView?.layer?.transform = CATransform3DIdentity
+                NSApp.deactivate()
+            }
+        }
+        animateOverlayScale(to: 0.96, fallbackFrom: 1,
+                            duration: 0.17, timing: .easeIn)
+    }
+
+    private func animateOverlayScale(to targetScale: CGFloat,
+                                     fallbackFrom: CGFloat,
+                                     duration: TimeInterval,
+                                     timing: CAMediaTimingFunctionName) {
+        guard let layer = window?.contentView?.layer else { return }
+        let currentTransform = layer.presentation()?.transform
+            ?? CATransform3DMakeScale(fallbackFrom, fallbackFrom, 1)
+        layer.removeAnimation(forKey: "LaunchPointOverlayScale")
+        let targetTransform = CATransform3DMakeScale(targetScale, targetScale, 1)
+        layer.transform = targetTransform
+        let animation = CABasicAnimation(keyPath: "transform")
+        animation.fromValue = NSValue(caTransform3D: currentTransform)
+        animation.toValue = NSValue(caTransform3D: targetTransform)
+        animation.duration = duration
+        animation.timingFunction = CAMediaTimingFunction(name: timing)
+        layer.add(animation, forKey: "LaunchPointOverlayScale")
     }
 
     /// 点击桌面或切换到另一应用时，不能留下一个仍在最上层的透明覆盖窗口。
@@ -396,6 +480,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let quit = NSMenuItem(title: "退出",
                                   action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
             menu.addItem(quit)
+            let stopAndQuit = NSMenuItem(title: "退出并关闭开机启动",
+                                         action: #selector(stopBackgroundAndQuit),
+                                         keyEquivalent: "")
+            stopAndQuit.target = self
+            menu.addItem(stopAndQuit)
             item.menu = menu
             item.button?.performClick(nil)
             item.menu = nil                            // 用完即卸,恢复左键直达
@@ -454,6 +543,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } catch {
             Settings.launchAtLogin = false
         }
+    }
+
+    @objc private func stopBackgroundAndQuit() {
+        Settings.launchAtLogin = false
+        if #available(macOS 13.0, *) {
+            try? SMAppService.mainApp.unregister()
+        }
+        RawTrackpadMonitor.shared.stop()
+        NSApp.terminate(nil)
+    }
+
+    func performStopBackgroundAndQuit() {
+        stopBackgroundAndQuit()
+    }
+
+    /// A running macOS process survives when its app bundle is moved to Trash.
+    /// Watch the original installation path so uninstalling also removes the
+    /// background listener and its login-item registration.
+    private func setUpInstallationMonitor() {
+        let originalBundlePath = Bundle.main.bundleURL.path
+        guard originalBundlePath.hasSuffix(".app") else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 3, repeating: 3, leeway: .seconds(1))
+        timer.setEventHandler {
+            guard !FileManager.default.fileExists(atPath: originalBundlePath) else { return }
+            Settings.launchAtLogin = false
+            if #available(macOS 13.0, *) {
+                try? SMAppService.mainApp.unregister()
+            }
+            RawTrackpadMonitor.shared.stop()
+            NSApp.terminate(nil)
+        }
+        installationMonitor = timer
+        timer.resume()
     }
 
     // MARK: - 键盘
@@ -618,6 +741,223 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.activateHotCornerIfNeeded()
             return event
         }
+    }
+
+    // MARK: - 触控板边缘唤起
+
+    private func setUpTrackpadWakeMonitor() {
+        // 全局监听仅注册 scrollWheel。把 swipe/magnify 混进同一 mask 会让
+        // 部分 macOS 版本完全不返回 monitor，连可靠的边缘滚动也一起失效。
+        globalTrackpadMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) {
+            [weak self] event in
+            DispatchQueue.main.async {
+                self?.activateTrackpadShortcutIfNeeded(event)
+            }
+        }
+        configureRawTrackpadMonitor()
+    }
+
+    func trackpadShortcutChanged() {
+        resetTrackpadWakeSession()
+        configureRawTrackpadMonitor()
+    }
+
+    func retryRawTrackpadMonitor() {
+        RawTrackpadMonitor.shared.stop()
+        configureRawTrackpadMonitor()
+    }
+
+    @objc private func workspaceDidWake(_ notification: Notification) {
+        guard Settings.trackpadShortcut == .fourFingerPinchIn
+                || Settings.trackpadShortcut == .fiveFingerPinchIn else { return }
+        AppState.shared.trackpadMonitorStatus = .connecting
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard Settings.trackpadShortcut == .fourFingerPinchIn
+                    || Settings.trackpadShortcut == .fiveFingerPinchIn else { return }
+            RawTrackpadMonitor.shared.stop()
+            self?.configureRawTrackpadMonitor()
+        }
+    }
+
+    private func configureRawTrackpadMonitor() {
+        let fingerCount: Int
+        switch Settings.trackpadShortcut {
+        case .fourFingerPinchIn:
+            fingerCount = 4
+        case .fiveFingerPinchIn:
+            fingerCount = 5
+        default:
+            RawTrackpadMonitor.shared.stop()
+            AppState.shared.trackpadMonitorStatus = .inactive
+            AppState.shared.rawTrackpadContactCount = 0
+            AppState.shared.rawTrackpadPinchProgress = 0
+            return
+        }
+
+        AppState.shared.trackpadMonitorStatus = .connecting
+        let started = RawTrackpadMonitor.shared.start(
+            fingerCount: fingerCount,
+            onContactCount: { count in
+                AppState.shared.rawTrackpadContactCount = count
+            },
+            onProgress: { progress in
+                AppState.shared.rawTrackpadPinchProgress = progress
+            },
+            onPinchIn: { [weak self] in
+                self?.activateRawTrackpadPinchInIfNeeded()
+            },
+            onPinchOut: { [weak self] in
+                self?.activateRawTrackpadPinchOutIfNeeded()
+            }
+        )
+        AppState.shared.trackpadMonitorStatus = started
+            ? .connected(fingerCount: fingerCount)
+            : .unavailable
+        if !started {
+            AppState.shared.rawTrackpadContactCount = 0
+            AppState.shared.rawTrackpadPinchProgress = 0
+        }
+    }
+
+    private func activateRawTrackpadPinchInIfNeeded() {
+        let shortcut = Settings.trackpadShortcut
+        guard shortcut == .fourFingerPinchIn || shortcut == .fiveFingerPinchIn else {
+            return
+        }
+        AppState.shared.rawTrackpadTriggerCount &+= 1
+        AppState.shared.rawTrackpadLastTriggerAt = Date()
+
+        // Keep diagnostics observable while settings is open. Recognition is
+        // recorded above, but an already-visible workspace must not toggle or
+        // steal focus from the settings controls.
+        guard AppState.shared.phase == .hidden else { return }
+        resetTrackpadWakeSession()
+        showOverlay()
+    }
+
+    private func activateRawTrackpadPinchOutIfNeeded() {
+        let shortcut = Settings.trackpadShortcut
+        guard shortcut == .fourFingerPinchIn || shortcut == .fiveFingerPinchIn,
+              window?.isVisible == true,
+              !AppState.shared.showSettings,
+              AppState.shared.openFolderID == nil else { return }
+        AppState.shared.rawTrackpadTriggerCount &+= 1
+        AppState.shared.rawTrackpadLastTriggerAt = Date()
+        dismissOverlay()
+    }
+
+    private func resetTrackpadWakeSession() {
+        trackpadWakeAccumulatedDistance = 0
+        trackpadWakeDirection = 0
+        trackpadWakeLastTimestamp = 0
+    }
+
+    private func activateTrackpadShortcutIfNeeded(_ event: NSEvent) {
+        let shortcut = Settings.trackpadShortcut
+        guard shortcut != .disabled,
+              window?.isVisible != true else {
+            resetTrackpadWakeSession()
+            return
+        }
+
+        guard event.timestamp >= trackpadWakeCooldownUntil else { return }
+        switch shortcut {
+        case .leftEdgeHorizontal, .rightEdgeHorizontal, .bottomEdgeVertical,
+                .topEdgeVertical:
+            activateEdgeTrackpadShortcutIfNeeded(event, shortcut: shortcut)
+        case .fourFingerPinchIn, .fiveFingerPinchIn:
+            break
+        case .disabled:
+            resetTrackpadWakeSession()
+        }
+    }
+
+    private func triggerTrackpadWake(from event: NSEvent) {
+        resetTrackpadWakeSession()
+        trackpadWakeCooldownUntil = event.timestamp + 1.1
+        showOverlay()
+    }
+
+    private func trackpadWakeLastEventTimestampShouldReset(_ timestamp: TimeInterval) -> Bool {
+        trackpadWakeLastTimestamp == 0 || timestamp - trackpadWakeLastTimestamp > 0.55
+    }
+
+    private func activateEdgeTrackpadShortcutIfNeeded(_ event: NSEvent,
+                                                      shortcut: TrackpadShortcut) {
+        guard event.type == .scrollWheel,
+              event.hasPreciseScrollingDeltas else {
+            resetTrackpadWakeSession()
+            return
+        }
+        let point = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(point) }) else {
+            resetTrackpadWakeSession()
+            return
+        }
+
+        let frame = screen.frame
+        // 给指针留出可操作的边缘带，避免必须精确压在屏幕最后几个像素上。
+        let edgeInset: CGFloat = 32
+        let dx = event.scrollingDeltaX == 0 ? event.deltaX : event.scrollingDeltaX
+        let dy = event.scrollingDeltaY == 0 ? event.deltaY : event.scrollingDeltaY
+
+        let edgeAndDelta: (inEdge: Bool, delta: CGFloat, axis: CGFloat)
+        switch shortcut {
+        case .disabled:
+            edgeAndDelta = (false, 0, 0)
+        case .leftEdgeHorizontal:
+            edgeAndDelta = (
+                point.x <= frame.minX + edgeInset,
+                abs(dx) > abs(dy) * 1.35 ? dx : 0,
+                1
+            )
+        case .rightEdgeHorizontal:
+            edgeAndDelta = (
+                point.x >= frame.maxX - edgeInset,
+                abs(dx) > abs(dy) * 1.35 ? dx : 0,
+                1
+            )
+        case .bottomEdgeVertical:
+            edgeAndDelta = (
+                point.y <= frame.minY + edgeInset,
+                abs(dy) > abs(dx) * 1.35 ? dy : 0,
+                2
+            )
+        case .topEdgeVertical:
+            edgeAndDelta = (
+                point.y >= frame.maxY - edgeInset,
+                abs(dy) > abs(dx) * 1.35 ? dy : 0,
+                2
+            )
+        case .fourFingerPinchIn, .fiveFingerPinchIn:
+            edgeAndDelta = (false, 0, 0)
+        }
+
+        guard edgeAndDelta.inEdge,
+              edgeAndDelta.delta != 0 else {
+            if event.phase == .ended || event.phase == .cancelled ||
+                event.momentumPhase == .ended || event.momentumPhase == .cancelled {
+                resetTrackpadWakeSession()
+            }
+            return
+        }
+
+        if trackpadWakeLastEventTimestampShouldReset(event.timestamp) {
+            resetTrackpadWakeSession()
+        }
+        if trackpadWakeDirection != 0,
+           trackpadWakeDirection != edgeAndDelta.axis {
+            resetTrackpadWakeSession()
+        }
+
+        // 只锁定横/纵轴，不依赖滚动正负方向，从而兼容 macOS 的
+        // “自然滚动”开关以及不同触控板驱动返回的 delta 符号。
+        trackpadWakeDirection = edgeAndDelta.axis
+        trackpadWakeLastTimestamp = event.timestamp
+        trackpadWakeAccumulatedDistance += abs(edgeAndDelta.delta)
+
+        guard trackpadWakeAccumulatedDistance >= 28 else { return }
+        triggerTrackpadWake(from: event)
     }
 
     private func activateHotCornerIfNeeded() {

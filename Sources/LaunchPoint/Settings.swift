@@ -129,6 +129,43 @@ enum HotCorner: String, CaseIterable, Identifiable {
     }
 }
 
+/// 边缘双指使用公开滚动事件；四指/五指聚拢与扩散使用原始触点帧。
+enum TrackpadShortcut: String, CaseIterable, Identifiable {
+    case disabled
+    case leftEdgeHorizontal
+    case rightEdgeHorizontal
+    case bottomEdgeVertical
+    case topEdgeVertical
+    case fourFingerPinchIn
+    case fiveFingerPinchIn
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .disabled: return "关闭"
+        case .leftEdgeHorizontal: return "左边缘横滑"
+        case .rightEdgeHorizontal: return "右边缘横滑"
+        case .bottomEdgeVertical: return "底部纵滑"
+        case .topEdgeVertical: return "顶部纵滑"
+        case .fourFingerPinchIn: return "四指聚拢 / 扩散"
+        case .fiveFingerPinchIn: return "五指聚拢 / 扩散"
+        }
+    }
+
+    var helpText: String {
+        switch self {
+        case .disabled:
+            return "关闭触控板唤起"
+        case .leftEdgeHorizontal, .rightEdgeHorizontal, .bottomEdgeVertical,
+                .topEdgeVertical:
+            return "在屏幕边缘双指滑动，不占用系统三指或四指手势"
+        case .fourFingerPinchIn, .fiveFingerPinchIn:
+            return "聚拢显示，扩散隐藏；只观察手势，不拦截系统操作"
+        }
+    }
+}
+
 struct LayoutBackupDocument: FileDocument {
     static var readableContentTypes: [UTType] { [.json] }
 
@@ -273,6 +310,14 @@ enum Settings {
         get { HotCorner(rawValue: defaults.string(forKey: "HotCorner") ?? "") ?? .disabled }
         set { defaults.set(newValue.rawValue, forKey: "HotCorner") }
     }
+
+    static var trackpadShortcut: TrackpadShortcut {
+        get {
+            TrackpadShortcut(rawValue: defaults.string(forKey: "TrackpadShortcut") ?? "")
+                ?? .disabled
+        }
+        set { defaults.set(newValue.rawValue, forKey: "TrackpadShortcut") }
+    }
 }
 
 /// 独立设置窗口(⌘, 打开;修改即时生效)。
@@ -292,6 +337,8 @@ struct SettingsPanel: View {
     @State private var blurWallpaper = Settings.blurWallpaper
     @State private var showMenuBarIcon = Settings.showMenuBarIcon
     @State private var hotCorner = Settings.hotCorner
+    @State private var trackpadShortcut = Settings.trackpadShortcut
+    @ObservedObject private var appState = AppState.shared
     @State private var backupDocument: LayoutBackupDocument?
     @State private var showExporter = false
     @State private var showImporter = false
@@ -506,6 +553,55 @@ struct SettingsPanel: View {
 
                 Divider()
 
+                settingRow("触控板唤起", detail: trackpadShortcut.helpText) {
+                    Picker("触控板唤起", selection: $trackpadShortcut) {
+                        ForEach(TrackpadShortcut.allCases) { shortcut in
+                            Text(shortcut.label).tag(shortcut)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 150)
+                    .onChange(of: trackpadShortcut) { _, newValue in
+                        Settings.trackpadShortcut = newValue
+                        (NSApp.delegate as? AppDelegate)?.trackpadShortcutChanged()
+                    }
+                }
+
+                if trackpadUsesRawContacts {
+                    Divider()
+                    settingRow("多指监听", detail: trackpadMonitorDetail) {
+                        HStack(spacing: 8) {
+                            if appState.trackpadMonitorStatus == .connecting {
+                                ProgressView().controlSize(.small)
+                            }
+                            if appState.trackpadMonitorStatus == .unavailable {
+                                Button("重新连接") {
+                                    (NSApp.delegate as? AppDelegate)?.retryRawTrackpadMonitor()
+                                }
+                            } else {
+                                Image(systemName: trackpadMonitorSymbol)
+                                    .foregroundStyle(trackpadMonitorTint)
+                            }
+                        }
+                    }
+
+                    Divider()
+                    settingRow("触点诊断", detail: trackpadContactDetail) {
+                        VStack(alignment: .trailing, spacing: 5) {
+                            Text("\(appState.rawTrackpadContactCount) 指")
+                                .font(.body.monospacedDigit().weight(.medium))
+                                .foregroundStyle(appState.rawTrackpadContactCount > 0
+                                                 ? AppTheme.blue : AppTheme.secondaryText)
+                            ProgressView(value: abs(appState.rawTrackpadPinchProgress))
+                                .progressViewStyle(.linear)
+                                .tint(AppTheme.blue)
+                                .frame(width: 112)
+                        }
+                    }
+                }
+
+                Divider()
+
                 settingRow("显示菜单栏图标", detail: "隐藏后仍可使用快捷键唤起") {
                     Toggle("显示菜单栏图标", isOn: $showMenuBarIcon)
                         .labelsHidden()
@@ -709,7 +805,7 @@ struct SettingsPanel: View {
                 Divider()
                 settingRow("检查更新", detail: updateStatusDetail) {
                     HStack(spacing: 8) {
-                        if case .checking = updateChecker.state {
+                        if updateChecker.isBusy {
                             ProgressView()
                                 .controlSize(.small)
                         }
@@ -722,11 +818,17 @@ struct SettingsPanel: View {
                 if let release = updateChecker.availableRelease {
                     Divider()
                     settingRow("发现新版本", detail: release.version) {
-                        Button("下载更新") {
-                            NSWorkspace.shared.open(updateChecker.preferredDownloadURL
-                                                    ?? release.releaseURL)
+                        Button("自动更新") {
+                            updateChecker.installAvailableUpdate()
                         }
                         .buttonStyle(.borderedProminent)
+                        .disabled(updateChecker.isBusy)
+                    }
+                    Divider()
+                    settingRow("发行版页面", detail: "自动更新失败时可手动下载") {
+                        Button("打开") {
+                            NSWorkspace.shared.open(release.releaseURL)
+                        }
                     }
                 }
                 Divider()
@@ -746,8 +848,54 @@ struct SettingsPanel: View {
     }
 
     private var isCheckingForUpdates: Bool {
-        if case .checking = updateChecker.state { return true }
-        return false
+        updateChecker.isBusy
+    }
+
+    private var trackpadUsesRawContacts: Bool {
+        trackpadShortcut == .fourFingerPinchIn || trackpadShortcut == .fiveFingerPinchIn
+    }
+
+    private var trackpadMonitorDetail: String {
+        switch appState.trackpadMonitorStatus {
+        case .inactive:
+            return "监听尚未启动"
+        case .connecting:
+            return "正在连接触控板"
+        case .connected(let fingerCount):
+            return "已连接，正在识别 \(fingerCount) 指聚拢与扩散"
+        case .unavailable:
+            return "无法连接原始触控板，请重新连接或使用边缘双指"
+        }
+    }
+
+    private var trackpadMonitorSymbol: String {
+        switch appState.trackpadMonitorStatus {
+        case .connected: return "checkmark.circle.fill"
+        case .connecting: return "clock"
+        case .inactive: return "pause.circle"
+        case .unavailable: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var trackpadContactDetail: String {
+        if let date = appState.rawTrackpadLastTriggerAt {
+            return "已触发 \(appState.rawTrackpadTriggerCount) 次，最近于 \(date.formatted(date: .omitted, time: .standard))"
+        }
+        if appState.rawTrackpadContactCount > 0 {
+            let progress = appState.rawTrackpadPinchProgress
+            let percent = Int((abs(progress) * 100).rounded())
+            let direction = progress < 0 ? "扩散" : "聚拢"
+            return "正在接收原始触点，\(direction)进度 \(percent)%"
+        }
+        return "触摸板静止；放上手指后数字会实时变化"
+    }
+
+    private var trackpadMonitorTint: Color {
+        switch appState.trackpadMonitorStatus {
+        case .connected: return .green
+        case .unavailable: return .orange
+        case .inactive, .connecting: return .secondary
+        }
     }
 
     private var displayCurrentVersion: String {
@@ -759,6 +907,8 @@ struct SettingsPanel: View {
     private var updateCheckButtonTitle: String {
         switch updateChecker.state {
         case .checking: return "检查中"
+        case .downloading: return "下载中"
+        case .installing: return "安装中"
         case .updateAvailable: return "重新检查"
         default: return "检查更新"
         }
@@ -770,6 +920,10 @@ struct SettingsPanel: View {
             return "从 GitHub Releases 获取最新版本"
         case .checking:
             return "正在连接 GitHub"
+        case .downloading(let version):
+            return "正在下载 \(version)"
+        case .installing(let version):
+            return "正在安装 \(version)，完成后会自动重启"
         case .upToDate(let latestVersion):
             return "已是最新版本（\(latestVersion)）"
         case .updateAvailable(let release):

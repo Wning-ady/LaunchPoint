@@ -11,9 +11,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.1/LaunchPoint-v0.1.1-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
+  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.2/LaunchPoint-v0.1.2-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
   ·
-  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.1/LaunchPoint-v0.1.1-x86_64.dmg"><strong>Intel 下载</strong></a>
+  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.2/LaunchPoint-v0.1.2-x86_64.dmg"><strong>Intel 下载</strong></a>
   ·
   <a href="https://github.com/Wning-ady/LaunchPoint/releases">全部发行版</a>
   ·
@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  macOS 14+ · Swift 6 · MIT License · 当前版本 v0.1.1
+  macOS 14+ · Swift 6 · MIT License · 当前版本 v0.1.2
 </p>
 
 ## 简介
@@ -56,16 +56,18 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 ### 系统集成
 
 - 自定义全局快捷键、F4 开关和触发角。
+- 支持四指或五指触控板手势：聚拢显示，扩散隐藏。
 - 主显示器、活跃显示器和鼠标所在显示器策略。
 - 登录时启动与菜单栏入口。
-- 应用内检查 GitHub Releases 更新，并自动匹配当前处理器架构。
+- 应用内检查并安装 GitHub Releases 更新，自动匹配当前处理器架构。
+- 应用移入废纸篓后自动停止后台进程，并可退出同时关闭开机启动。
 
 ## 安装
 
 | Mac | 安装包 |
 | --- | --- |
-| Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.1/LaunchPoint-v0.1.1-arm64.dmg) |
-| Intel | [下载 x86_64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.1/LaunchPoint-v0.1.1-x86_64.dmg) |
+| Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.2/LaunchPoint-v0.1.2-arm64.dmg) |
+| Intel | [下载 x86_64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.2/LaunchPoint-v0.1.2-x86_64.dmg) |
 
 1. 打开与你的 Mac 匹配的 DMG。
 2. 将 `LaunchPoint.app` 拖入 `Applications`。
@@ -86,8 +88,8 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 ```text
 dist/LaunchPoint-arm64.app
 dist/LaunchPoint-x86_64.app
-dist/LaunchPoint-v0.1.1-arm64.dmg
-dist/LaunchPoint-v0.1.1-x86_64.dmg
+dist/LaunchPoint-v0.1.2-arm64.dmg
+dist/LaunchPoint-v0.1.2-x86_64.dmg
 ```
 
 严格类型检查：
@@ -111,6 +113,7 @@ Sources/LaunchPoint/
 ├── ContentView.swift    # 主界面与交互
 ├── KeyboardNav.swift    # 键盘导航
 ├── LayoutStore.swift    # 布局与持久化
+├── RawTrackpadMonitor.swift # 多指触控板手势识别
 ├── SearchEngine.swift   # 搜索与排序
 ├── Settings.swift       # 设置界面与偏好
 ├── UpdateChecker.swift  # GitHub 发行版更新检测
@@ -148,4 +151,4 @@ LaunchPoint 依据 [MIT License](LICENSE) 开源。欢迎通过 [Issue](https://
 
 - 安装包尚未公证。
 - 纵向滚动模式暂不支持图标拖拽重排。
-- 多显示器、触控板惯性和大量应用场景仍在持续测试。
+- 多显示器、触控板设备差异和大量应用场景仍在持续测试。

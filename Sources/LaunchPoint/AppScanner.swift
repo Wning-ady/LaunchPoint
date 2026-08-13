@@ -42,7 +42,7 @@ enum AppScanner {
             let fullPath = normalizedURL.path
             guard seen.insert(fullPath).inserted else { return }
 
-            let name = normalizedURL.deletingPathExtension().lastPathComponent
+            let name = localizedDisplayName(for: normalizedURL)
             let cacheKey = fullPath as NSString
             let icon: NSImage
             if let cached = iconCache.object(forKey: cacheKey) {
@@ -99,6 +99,42 @@ enum AppScanner {
         return items.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
+    }
+
+    /// Prefer the same localized name Finder shows for app bundles, then fall
+    /// back through bundle metadata and finally the file name. This keeps
+    /// built-in apps aligned with the current macOS language.
+    private static func localizedDisplayName(for url: URL) -> String {
+        let isApplication = url.pathExtension.caseInsensitiveCompare("app") == .orderedSame
+
+        func cleaned(_ rawName: String?) -> String? {
+            guard var name = rawName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !name.isEmpty else { return nil }
+            if isApplication, name.lowercased().hasSuffix(".app") {
+                name = String(name.dropLast(4))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return name.isEmpty ? nil : name
+        }
+
+        let finderName = cleaned(FileManager.default.displayName(atPath: url.path))
+        guard isApplication else {
+            return finderName ?? url.deletingPathExtension().lastPathComponent
+        }
+
+        let bundle = Bundle(url: url)
+        let localizedInfo = bundle?.localizedInfoDictionary
+        let info = bundle?.infoDictionary
+        let candidates = [
+            finderName,
+            cleaned(localizedInfo?["CFBundleDisplayName"] as? String),
+            cleaned(localizedInfo?["CFBundleName"] as? String),
+            cleaned(info?["CFBundleDisplayName"] as? String),
+            cleaned(info?["CFBundleName"] as? String),
+            cleaned(url.deletingPathExtension().lastPathComponent),
+        ]
+        return candidates.compactMap { $0 }.first
+            ?? url.deletingPathExtension().lastPathComponent
     }
 
     static func isLaunchable(_ url: URL) -> Bool {
