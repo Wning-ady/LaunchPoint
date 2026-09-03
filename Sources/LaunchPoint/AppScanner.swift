@@ -18,8 +18,18 @@ struct AppItem: Identifiable {
 
 /// Scans application directories for installed apps.
 enum AppScanner {
-    private static let iconCache = NSCache<NSString, NSImage>()
+    private static let iconCache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 512
+        return cache
+    }()
     private static let maximumSearchDepth = 5
+    private static let iconDisplaySize = NSSize(width: 160, height: 160)
+
+    private struct IconDescriptor {
+        let cacheKey: NSString
+        let resourceURL: URL?
+    }
 
     static let defaultSearchDirs: [String] = [
         "/Applications",
@@ -43,14 +53,16 @@ enum AppScanner {
             guard seen.insert(fullPath).inserted else { return }
 
             let name = localizedDisplayName(for: normalizedURL)
-            let cacheKey = fullPath as NSString
+            let descriptor = iconDescriptor(for: normalizedURL)
             let icon: NSImage
-            if let cached = iconCache.object(forKey: cacheKey) {
+            if let cached = iconCache.object(forKey: descriptor.cacheKey) {
                 icon = cached
             } else {
-                icon = workspace.icon(forFile: fullPath)
-                icon.size = NSSize(width: 160, height: 160)
-                iconCache.setObject(icon, forKey: cacheKey)
+                let loaded = descriptor.resourceURL.flatMap(NSImage.init(contentsOf:))
+                    ?? workspace.icon(forFile: fullPath)
+                icon = (loaded.copy() as? NSImage) ?? loaded
+                icon.size = iconDisplaySize
+                iconCache.setObject(icon, forKey: descriptor.cacheKey)
             }
             items.append(
                 AppItem(id: fullPath,
@@ -99,6 +111,122 @@ enum AppScanner {
         return items.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
+    }
+
+    /// Build a cache key from the files that can change during an in-place update.
+    /// A path-only cache otherwise keeps the old/generic icon forever after reinstalling.
+    private static func iconDescriptor(for url: URL) -> IconDescriptor {
+        guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame else {
+            return IconDescriptor(cacheKey: fileFingerprint([url]), resourceURL: nil)
+        }
+
+        let contents = url.appendingPathComponent("Contents", isDirectory: true)
+        let infoURL = contents.appendingPathComponent("Info.plist")
+        let resourcesURL = contents.appendingPathComponent("Resources", isDirectory: true)
+        let info = infoDictionary(at: infoURL)
+        let iconURL = applicationIconURL(
+            appURL: url,
+            resourcesURL: resourcesURL,
+            info: info
+        )
+        let executableURL = (info?["CFBundleExecutable"] as? String).map {
+            contents.appendingPathComponent("MacOS", isDirectory: true).appendingPathComponent($0)
+        }
+        let assetsURL = resourcesURL.appendingPathComponent("Assets.car")
+        let fingerprinted = [url, infoURL, resourcesURL, executableURL, iconURL, assetsURL]
+            .compactMap { $0 }
+        return IconDescriptor(
+            cacheKey: fileFingerprint(fingerprinted),
+            resourceURL: iconURL
+        )
+    }
+
+    private static func infoDictionary(at url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil)
+        else { return nil }
+        return plist as? [String: Any]
+    }
+
+    /// Prefer the app's declared icon resource. If a package declares a missing
+    /// extension (for example .png while only the same-name .icns exists), try
+    /// the sibling resource before falling back to NSWorkspace's generic icon.
+    private static func applicationIconURL(appURL: URL,
+                                           resourcesURL: URL,
+                                           info: [String: Any]?) -> URL? {
+        var declaredNames: [String] = []
+        for key in ["CFBundleIconFile", "CFBundleIconName"] {
+            if let value = info?[key] as? String { declaredNames.append(value) }
+        }
+        declaredNames.append(contentsOf: info?["CFBundleIconFiles"] as? [String] ?? [])
+        if let icons = info?["CFBundleIcons"] as? [String: Any],
+           let primary = icons["CFBundlePrimaryIcon"] as? [String: Any] {
+            declaredNames.append(contentsOf: primary["CFBundleIconFiles"] as? [String] ?? [])
+        }
+
+        var candidates: [URL] = []
+        for rawName in declaredNames {
+            let name = (rawName as NSString).lastPathComponent
+            guard !name.isEmpty, name != ".", name != ".." else { continue }
+            let declared = resourcesURL.appendingPathComponent(name)
+            candidates.append(declared)
+            if declared.pathExtension.isEmpty {
+                candidates.append(declared.appendingPathExtension("icns"))
+                candidates.append(declared.appendingPathExtension("png"))
+            } else {
+                let base = declared.deletingPathExtension()
+                candidates.append(base.appendingPathExtension("icns"))
+                candidates.append(base.appendingPathExtension("png"))
+            }
+        }
+        if let existing = firstReadableImage(in: candidates) { return existing }
+
+        guard let resources = try? FileManager.default.contentsOfDirectory(
+            at: resourcesURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        let icnsFiles = resources.filter {
+            $0.pathExtension.caseInsensitiveCompare("icns") == .orderedSame
+        }
+        if icnsFiles.count == 1 { return icnsFiles[0] }
+
+        let preferredBaseNames = Set([
+            "appicon",
+            "icon",
+            appURL.deletingPathExtension().lastPathComponent.lowercased(),
+            (info?["CFBundleExecutable"] as? String)?.lowercased() ?? "",
+        ])
+        return icnsFiles.first {
+            preferredBaseNames.contains($0.deletingPathExtension().lastPathComponent.lowercased())
+        }
+    }
+
+    private static func firstReadableImage(in candidates: [URL]) -> URL? {
+        var seen = Set<String>()
+        return candidates.first { candidate in
+            let path = candidate.standardizedFileURL.path
+            guard seen.insert(path).inserted else { return false }
+            return FileManager.default.isReadableFile(atPath: path)
+                && NSImage(contentsOf: candidate) != nil
+        }
+    }
+
+    private static func fileFingerprint(_ urls: [URL]) -> NSString {
+        var components: [String] = []
+        for url in urls {
+            let path = url.standardizedFileURL.path
+            components.append(path)
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else {
+                components.append("missing")
+                continue
+            }
+            let modified = (attributes[.modificationDate] as? Date)?
+                .timeIntervalSinceReferenceDate ?? 0
+            let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+            components.append("\(modified):\(size)")
+        }
+        return components.joined(separator: "|") as NSString
     }
 
     /// Prefer the same localized name Finder shows for app bundles, then fall

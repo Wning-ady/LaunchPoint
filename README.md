@@ -11,9 +11,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.2/LaunchPoint-v0.1.2-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
+  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.3/LaunchPoint-v0.1.3-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
   ·
-  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.2/LaunchPoint-v0.1.2-x86_64.dmg"><strong>Intel 下载</strong></a>
+  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.3/LaunchPoint-v0.1.3-x86_64.dmg"><strong>Intel 下载</strong></a>
   ·
   <a href="https://github.com/Wning-ady/LaunchPoint/releases">全部发行版</a>
   ·
@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  macOS 14+ · Swift 6 · MIT License · 当前版本 v0.1.2
+  macOS 14+ · Swift 6 · MIT License · 当前版本 v0.1.3
 </p>
 
 ## 简介
@@ -43,6 +43,8 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 
 - 拖拽排序、跨页移动、创建文件夹和文件夹改名。
 - 隐藏、恢复、别名、简介、卸载及在 Finder 中显示。
+- 卸载前自动退出目标应用，并清理扩展、App Group 与 iCloud 容器等关联数据。
+- 应用重装或原路径更新后自动刷新图标；图标声明错误时尝试读取包内可用资源。
 - 布局导入、导出和持久化保存。
 - 应用与文件夹独立右键菜单。
 
@@ -66,8 +68,8 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 
 | Mac | 安装包 |
 | --- | --- |
-| Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.2/LaunchPoint-v0.1.2-arm64.dmg) |
-| Intel | [下载 x86_64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.2/LaunchPoint-v0.1.2-x86_64.dmg) |
+| Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.3/LaunchPoint-v0.1.3-arm64.dmg) |
+| Intel | [下载 x86_64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.3/LaunchPoint-v0.1.3-x86_64.dmg) |
 
 1. 打开与你的 Mac 匹配的 DMG。
 2. 将 `LaunchPoint.app` 拖入 `Applications`。
@@ -88,8 +90,8 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 ```text
 dist/LaunchPoint-arm64.app
 dist/LaunchPoint-x86_64.app
-dist/LaunchPoint-v0.1.2-arm64.dmg
-dist/LaunchPoint-v0.1.2-x86_64.dmg
+dist/LaunchPoint-v0.1.3-arm64.dmg
+dist/LaunchPoint-v0.1.3-x86_64.dmg
 ```
 
 严格类型检查：
