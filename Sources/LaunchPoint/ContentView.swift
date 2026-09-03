@@ -611,12 +611,12 @@ struct ContentView: View {
                             dismiss()   // Finder 的管理员认证弹窗不能被全屏层挡住
                         },
                         completion: { error in
+                            // 即使只有个别残留清理失败，应用本体也可能已经移除。
+                            store.refreshAsync()
                             if let error {
                                 uninstallError = error
                                 // 覆盖层可能已收起,重新唤起以展示错误
                                 (NSApp.delegate as? AppDelegate)?.showOverlay()
-                            } else {
-                                store.refreshAsync()
                             }
                         }
                     )
@@ -625,13 +625,16 @@ struct ContentView: View {
             }
             Button("取消", role: .cancel) { uninstallTarget = nil }
         } message: {
-            let residuals = AppActions.residualPaths(bundleID: uninstallTarget?.bundleID).count
+            let residuals = AppActions.residualPaths(
+                appURL: uninstallTarget?.url,
+                bundleID: uninstallTarget?.bundleID
+            ).count
             Text(residuals > 0
                  ? "应用本体与 \(residuals) 项残留数据(缓存、偏好设置等)将一并移到废纸篓,可随时恢复。"
                  : "应用将被移到废纸篓,可随时恢复。")
         }
         // 卸载失败提示
-        .alert("卸载失败", isPresented: isUninstallErrorPresented) {
+        .alert("卸载未完全完成", isPresented: isUninstallErrorPresented) {
             Button("好", role: .cancel) { uninstallError = nil }
         } message: {
             Text(uninstallError ?? "")
@@ -1956,8 +1959,9 @@ struct AppInfoPanel: View {
         .frame(width: 400)
         .task {
             // 目录遍历较慢,后台计算
+            let appURL = app.url
             let bytes = await Task.detached(priority: .utility) {
-                AppActions.size(of: app.url)
+                AppActions.size(of: appURL)
             }.value
             sizeText = AppActions.formatBytes(bytes)
         }

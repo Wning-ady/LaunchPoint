@@ -1,4 +1,5 @@
 import AppKit
+import Security
 
 /// 应用级操作:添加到程序坞、简介信息、卸载(含残留清理)。
 enum AppActions {
@@ -133,21 +134,186 @@ enum AppActions {
 
     // MARK: - 卸载
 
-    /// 应用的用户级残留数据路径。严格按 bundleID 精确匹配,宁缺毋滥。
-    static func residualPaths(bundleID: String?) -> [URL] {
-        guard let bundleID, !bundleID.isEmpty else { return [] }
-        let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-        let candidates = [
-            "Application Support/\(bundleID)",
-            "Caches/\(bundleID)",
-            "Preferences/\(bundleID).plist",
-            "Logs/\(bundleID)",
-            "Saved Application State/\(bundleID).savedState",
-            "HTTPStorages/\(bundleID)",
-            "WebKit/\(bundleID)",
-            "Containers/\(bundleID)",
-        ].map { library.appendingPathComponent($0) }
-        return candidates.filter { FileManager.default.fileExists(atPath: $0.path) }
+    private struct UninstallMetadata {
+        var bundleIDs = Set<String>()
+        var groupContainerIDs = Set<String>()
+        var iCloudContainerIDs = Set<String>()
+        var appNames = Set<String>()
+    }
+
+    /// 返回应用及其内嵌扩展的用户级关联数据。卸载前读取签名权限，才能识别
+    /// Widget/Share Extension、App Group 与 iCloud 容器；应用包被移走后这些信息就丢失了。
+    static func residualPaths(appURL: URL? = nil, bundleID: String?) -> [URL] {
+        let metadata = uninstallMetadata(appURL: appURL, fallbackBundleID: bundleID)
+        guard !metadata.bundleIDs.isEmpty || !metadata.appNames.isEmpty else { return [] }
+
+        let fm = FileManager.default
+        let library = fm.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+        var candidates = Set<URL>()
+
+        func add(_ relativePath: String) {
+            candidates.insert(library.appendingPathComponent(relativePath).standardizedFileURL)
+        }
+
+        for identifier in metadata.bundleIDs where isSafePathComponent(identifier) {
+            [
+                "Application Support/\(identifier)",
+                "Caches/\(identifier)",
+                "Preferences/\(identifier).plist",
+                "Logs/\(identifier)",
+                "Saved Application State/\(identifier).savedState",
+                "HTTPStorages/\(identifier)",
+                "WebKit/\(identifier)",
+                "Containers/\(identifier)",
+                "Application Scripts/\(identifier)",
+                "Cookies/\(identifier).binarycookies",
+                "LaunchAgents/\(identifier).plist",
+            ].forEach(add)
+
+            // cfprefsd may create a host-specific preference alongside the main plist.
+            let byHost = library.appendingPathComponent("Preferences/ByHost", isDirectory: true)
+            addChildren(of: byHost, to: &candidates) { name in
+                let lowered = name.lowercased()
+                return lowered.hasPrefix(identifier.lowercased() + ".")
+                    && lowered.hasSuffix(".plist")
+            }
+        }
+
+        // A small number of non-sandboxed apps use their product name instead of bundle ID.
+        for name in metadata.appNames where isSafePathComponent(name) && name.count >= 3 {
+            [
+                "Application Support/\(name)",
+                "Caches/\(name)",
+                "Logs/\(name)",
+                "HTTPStorages/\(name)",
+                "WebKit/\(name)",
+                "Saved Application State/\(name).savedState",
+            ].forEach(add)
+        }
+
+        for identifier in metadata.groupContainerIDs where isSafePathComponent(identifier) {
+            add("Group Containers/\(identifier)")
+            add("Application Scripts/\(identifier)")
+        }
+        for identifier in metadata.iCloudContainerIDs where isSafePathComponent(identifier) {
+            let directoryName = identifier.replacingOccurrences(of: ".", with: "~")
+            add("Mobile Documents/\(directoryName)")
+        }
+
+        // Some older/ad-hoc signed apps do not expose entitlements through Security.framework.
+        // Exact bundle-ID suffix matching recovers their App Group/iCloud paths without broad scans.
+        for identifier in metadata.bundleIDs {
+            let loweredID = identifier.lowercased()
+            let groupRoot = library.appendingPathComponent("Group Containers", isDirectory: true)
+            addChildren(of: groupRoot, to: &candidates) { name in
+                name.lowercased().hasSuffix("." + loweredID)
+            }
+            let scriptsRoot = library.appendingPathComponent("Application Scripts", isDirectory: true)
+            addChildren(of: scriptsRoot, to: &candidates) { name in
+                let lowered = name.lowercased()
+                return lowered == loweredID || lowered.hasSuffix("." + loweredID)
+            }
+            let cloudSuffix = "~" + loweredID.replacingOccurrences(of: ".", with: "~")
+            let mobileDocuments = library.appendingPathComponent("Mobile Documents", isDirectory: true)
+            addChildren(of: mobileDocuments, to: &candidates) { name in
+                name.lowercased().hasSuffix(cloudSuffix)
+            }
+        }
+
+        return candidates
+            .filter { fm.fileExists(atPath: $0.path) }
+            .sorted { $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending }
+    }
+
+    private static func uninstallMetadata(appURL: URL?, fallbackBundleID: String?) -> UninstallMetadata {
+        var metadata = UninstallMetadata()
+        if let fallbackBundleID, !fallbackBundleID.isEmpty {
+            metadata.bundleIDs.insert(fallbackBundleID)
+        }
+        guard let appURL,
+              appURL.pathExtension.caseInsensitiveCompare("app") == .orderedSame else {
+            return metadata
+        }
+
+        var bundleURLs = [appURL]
+        if let enumerator = FileManager.default.enumerator(
+            at: appURL.appendingPathComponent("Contents", isDirectory: true),
+            includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey],
+            options: [.skipsHiddenFiles],
+            errorHandler: { _, _ in true }
+        ) {
+            while let url = enumerator.nextObject() as? URL {
+                let ext = url.pathExtension.lowercased()
+                if ext == "app" || ext == "appex" || ext == "xpc" {
+                    bundleURLs.append(url)
+                    enumerator.skipDescendants()
+                }
+            }
+        }
+
+        for url in bundleURLs {
+            if let bundle = Bundle(url: url) {
+                if let identifier = bundle.bundleIdentifier, !identifier.isEmpty {
+                    metadata.bundleIDs.insert(identifier)
+                }
+                for key in ["CFBundleDisplayName", "CFBundleName"] {
+                    if let name = bundle.object(forInfoDictionaryKey: key) as? String,
+                       !name.isEmpty {
+                        metadata.appNames.insert(name)
+                    }
+                }
+            }
+            collectContainerIdentifiers(from: signingEntitlements(at: url), into: &metadata)
+        }
+        metadata.appNames.insert(appURL.deletingPathExtension().lastPathComponent)
+        return metadata
+    }
+
+    private static func signingEntitlements(at url: URL) -> [String: Any] {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess,
+              let code else { return [:] }
+        var signingInfo: CFDictionary?
+        let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
+        guard SecCodeCopySigningInformation(code, flags, &signingInfo) == errSecSuccess,
+              let dictionary = signingInfo as? [String: Any] else { return [:] }
+        return dictionary[kSecCodeInfoEntitlementsDict as String] as? [String: Any] ?? [:]
+    }
+
+    private static func collectContainerIdentifiers(from entitlements: [String: Any],
+                                                    into metadata: inout UninstallMetadata) {
+        let groupKeys = ["com.apple.security.application-groups"]
+        let cloudKeys = [
+            "com.apple.developer.icloud-container-identifiers",
+            "com.apple.developer.ubiquity-container-identifiers",
+        ]
+        for key in groupKeys {
+            for identifier in entitlements[key] as? [String] ?? [] where !identifier.isEmpty {
+                metadata.groupContainerIDs.insert(identifier)
+            }
+        }
+        for key in cloudKeys {
+            for identifier in entitlements[key] as? [String] ?? [] where !identifier.isEmpty {
+                metadata.iCloudContainerIDs.insert(identifier)
+            }
+        }
+    }
+
+    private static func addChildren(of directory: URL, to candidates: inout Set<URL>,
+                                    matching predicate: (String) -> Bool) {
+        guard let children = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) else { return }
+        for child in children where predicate(child.lastPathComponent) {
+            candidates.insert(child.standardizedFileURL)
+        }
+    }
+
+    private static func isSafePathComponent(_ value: String) -> Bool {
+        !value.isEmpty && value != "." && value != ".."
+            && !value.contains("/") && !value.contains(":")
     }
 
     /// 卸载:应用本体与残留数据全部移入废纸篓(可从废纸篓恢复)。
@@ -159,28 +325,112 @@ enum AppActions {
                           beforeFinderFallback: @escaping () -> Void,
                           completion: @escaping (String?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            var errorMessage: String?
-            do {
-                try FileManager.default.trashItem(at: appURL, resultingItemURL: nil)
-            } catch {
-                DispatchQueue.main.sync { beforeFinderFallback() }
-                if !finderTrash(appURL) {
-                    errorMessage = """
-                    无法移除“\(appURL.deletingPathExtension().lastPathComponent)”:权限不足,\
-                    且 Finder 代删被拒或被取消。
-                    可在 Finder 中手动将其移到废纸篓;若从未弹出过授权窗口,\
-                    请在 系统设置 → 隐私与安全性 → 自动化 中允许本应用控制 Finder 后重试。
-                    """
+            // 必须在移走 app 之前保存扩展和容器信息，否则 Bundle/签名已不可读取。
+            let metadata = uninstallMetadata(appURL: appURL, fallbackBundleID: bundleID)
+            let residuals = residualPaths(appURL: appURL, bundleID: bundleID)
+            let failedToQuit = terminateRunningApplications(
+                appURL: appURL,
+                bundleIDs: metadata.bundleIDs
+            )
+            if !failedToQuit.isEmpty {
+                let names = failedToQuit.joined(separator: "、")
+                DispatchQueue.main.async {
+                    completion("无法退出正在运行的 \(names)，因此尚未删除应用。请保存工作后再试。")
+                }
+                return
+            }
+
+            var finderWasPrepared = false
+            func moveToTrash(_ url: URL) -> Bool {
+                do {
+                    try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+                    return !FileManager.default.fileExists(atPath: url.path)
+                } catch {
+                    if !finderWasPrepared {
+                        DispatchQueue.main.sync { beforeFinderFallback() }
+                        finderWasPrepared = true
+                    }
+                    return finderTrash(url)
                 }
             }
-            if errorMessage == nil {
-                for residual in residualPaths(bundleID: bundleID) {
-                    try? FileManager.default.trashItem(at: residual, resultingItemURL: nil)
+
+            guard moveToTrash(appURL) else {
+                let errorMessage = """
+                无法移除“\(appURL.deletingPathExtension().lastPathComponent)”:权限不足,\
+                且 Finder 代删被拒或被取消。
+                可在 Finder 中手动将其移到废纸篓;若从未弹出过授权窗口,\
+                请在 系统设置 → 隐私与安全性 → 自动化 中允许本应用控制 Finder 后重试。
+                """
+                DispatchQueue.main.async { completion(errorMessage) }
+                return
+            }
+
+            var failedResiduals: [URL] = []
+            for residual in residuals where FileManager.default.fileExists(atPath: residual.path) {
+                if !moveToTrash(residual) { failedResiduals.append(residual) }
+            }
+            let relaunchedApps = terminateRunningApplications(
+                appURL: appURL,
+                bundleIDs: metadata.bundleIDs
+            )
+
+            // 固定图标与正在运行时产生的临时图标都要刷新。
+            if !removeFromDock(appURL) { restartDock() }
+
+            let errorMessage: String?
+            if failedResiduals.isEmpty && relaunchedApps.isEmpty {
+                errorMessage = nil
+            } else {
+                var details: [String] = ["应用本体已移到废纸篓，但卸载未完全结束。"]
+                if !relaunchedApps.isEmpty {
+                    details.append("仍无法退出：\(relaunchedApps.joined(separator: "、"))")
                 }
-                // 程序坞里若还挂着该应用,一并移除(否则留下"在废纸篓中"的死图标)
-                removeFromDock(appURL)
+                if !failedResiduals.isEmpty {
+                    let shown = failedResiduals.prefix(5).map(\.path).joined(separator: "\n")
+                    let omitted = failedResiduals.count > 5
+                        ? "\n另有 \(failedResiduals.count - 5) 项"
+                        : ""
+                    details.append("以下关联文件未能移除：\n\(shown)\(omitted)")
+                }
+                details.append("请检查 Finder 自动化或“完全磁盘访问权限”后重试。")
+                errorMessage = details.joined(separator: "\n")
             }
             DispatchQueue.main.async { completion(errorMessage) }
+        }
+    }
+
+    /// 先请求正常退出，给应用保存状态的机会；超时后强制退出。
+    /// 当前进程被排除，LaunchPoint 自卸载仍由安装路径监视器安全收尾。
+    private static func terminateRunningApplications(appURL: URL,
+                                                     bundleIDs: Set<String>) -> [String] {
+        let targetPath = appURL.standardizedFileURL.path
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let running: [NSRunningApplication] = DispatchQueue.main.sync {
+            NSWorkspace.shared.runningApplications.filter { application in
+                guard application.processIdentifier != currentPID else { return false }
+                if let identifier = application.bundleIdentifier,
+                   bundleIDs.contains(identifier) { return true }
+                guard let runningURL = application.bundleURL?.standardizedFileURL else { return false }
+                let path = runningURL.path
+                return path == targetPath || path.hasPrefix(targetPath + "/")
+            }
+        }
+        guard !running.isEmpty else { return [] }
+
+        for application in running { application.terminate() }
+        waitForTermination(of: running, timeout: 2.5)
+        let remaining = running.filter { !$0.isTerminated }
+        for application in remaining { application.forceTerminate() }
+        waitForTermination(of: remaining, timeout: 1.5)
+        return remaining.filter { !$0.isTerminated }.map {
+            $0.localizedName ?? $0.bundleIdentifier ?? "目标应用"
+        }
+    }
+
+    private static func waitForTermination(of applications: [NSRunningApplication], timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while applications.contains(where: { !$0.isTerminated }), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
         }
     }
 
