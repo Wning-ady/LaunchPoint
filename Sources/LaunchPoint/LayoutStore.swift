@@ -269,17 +269,33 @@ final class LayoutStore: ObservableObject {
     }
 
     /// Move an entry immediately before or after a visible target. Resolving the
-    /// target against the real page structure avoids treating a flattened list
-    /// index as a page/slot pair when earlier pages are not full.
+    /// target directly in the persisted entity list keeps the visible marker and
+    /// committed anchor identical even when a saved app is temporarily unscannable.
     func moveEntry(_ entryID: String, relativeTo targetID: String, after: Bool) {
-        for pageIndex in pages.indices {
-            let remaining = pages[pageIndex].filter { $0.id != entryID }
-            guard let targetIndex = remaining.firstIndex(where: { $0.id == targetID }) else {
-                continue
+        guard let (newApps, newGroups) = Self.applyMoveEntity(apps: layout.apps,
+                                                              groups: layout.groups,
+                                                              entityID: entryID,
+                                                              relativeTo: targetID,
+                                                              after: after) else { return }
+        layout.apps = newApps
+        layout.groups = newGroups
+        commitMutation()
+    }
+
+    /// 将持久化布局对齐到拖拽预览中的可见顺序。
+    /// 预览基于可见条目构建，直接使用相邻条目作为锚点可以避免隐藏项或
+    /// 空页面导致“动画落点”和松手后的最终位置出现偏移。
+    func moveEntryToMatchPreview(_ entryID: String, preview: [[PageEntry]]) {
+        for page in preview {
+            guard let sourceIndex = page.firstIndex(where: { $0.id == entryID }) else { continue }
+            if sourceIndex + 1 < page.count {
+                moveEntry(entryID, relativeTo: page[sourceIndex + 1].id, after: false)
+            } else if sourceIndex > 0 {
+                moveEntry(entryID, relativeTo: page[sourceIndex - 1].id, after: true)
+            } else {
+                let pageIndex = preview.firstIndex(where: { $0.contains(where: { $0.id == entryID }) }) ?? 0
+                moveEntry(entryID, toPage: pageIndex, slot: 0)
             }
-            moveEntry(entryID,
-                      toPage: pageIndex,
-                      slot: targetIndex + (after ? 1 : 0))
             return
         }
     }
@@ -872,6 +888,73 @@ final class LayoutStore: ObservableObject {
                 renumber(remaining, pageID: sp.id, page: sp.page, apps: &apps, groups: &groups)
             } else {
                 // 源是文件夹:成员 order 压实(拖出文件夹的路径)
+                compactFolderMembers(&apps, folderID: sourceGroupID)
+            }
+        }
+        return (apps, groups)
+    }
+
+    /// Pure function: move an entity directly before/after another persisted
+    /// entity. Unlike a numeric visible slot, this cannot drift when `pages`
+    /// omits an app whose bundle is temporarily unavailable during scanning.
+    static func applyMoveEntity(apps: [AppRecord], groups: [GroupRecord],
+                                entityID: String, relativeTo targetID: String, after: Bool)
+        -> (apps: [AppRecord], groups: [GroupRecord])? {
+        guard entityID != targetID else { return nil }
+        var apps = apps
+        var groups = groups
+
+        let isFolder = groups.contains { $0.id == entityID && $0.isFolder }
+        let appIndex = apps.firstIndex { $0.id == entityID }
+        guard isFolder || appIndex != nil else { return nil }
+
+        let pageGroups = groups.filter { !$0.isFolder }.sorted { $0.page < $1.page }
+        let targetPage: GroupRecord?
+        if let folder = groups.first(where: { $0.id == targetID && $0.isFolder }) {
+            targetPage = pageGroups.first { $0.page == folder.page }
+        } else if let targetApp = apps.first(where: { $0.id == targetID }) {
+            targetPage = pageGroups.first { $0.id == targetApp.groupID }
+        } else {
+            targetPage = nil
+        }
+        guard let targetPage else { return nil }
+
+        var sourceGroupID: String?
+        var sourceHostPage: GroupRecord?
+        if isFolder {
+            let folderPage = groups.first { $0.id == entityID }!.page
+            sourceHostPage = pageGroups.first { $0.page == folderPage }
+        } else {
+            sourceGroupID = apps[appIndex!].groupID
+        }
+
+        var targetEntities = entityList(apps: apps, groups: groups,
+                                        pageID: targetPage.id, page: targetPage.page)
+            .filter { $0.id != entityID }
+        guard let targetIndex = targetEntities.firstIndex(where: { $0.id == targetID }) else {
+            return nil
+        }
+        let moved = LayoutEntity(ref: isFolder ? .folder(entityID) : .app(entityID),
+                                 order: 0,
+                                 hidden: isFolder ? false : apps[appIndex!].hidden)
+        targetEntities.insert(moved, at: targetIndex + (after ? 1 : 0))
+        renumber(targetEntities, pageID: targetPage.id, page: targetPage.page,
+                 apps: &apps, groups: &groups)
+
+        if isFolder {
+            if let sourceHostPage, sourceHostPage.id != targetPage.id {
+                let remaining = entityList(apps: apps, groups: groups,
+                                           pageID: sourceHostPage.id, page: sourceHostPage.page)
+                renumber(remaining, pageID: sourceHostPage.id, page: sourceHostPage.page,
+                         apps: &apps, groups: &groups)
+            }
+        } else if let sourceGroupID, sourceGroupID != targetPage.id {
+            if let sourcePage = pageGroups.first(where: { $0.id == sourceGroupID }) {
+                let remaining = entityList(apps: apps, groups: groups,
+                                           pageID: sourcePage.id, page: sourcePage.page)
+                renumber(remaining, pageID: sourcePage.id, page: sourcePage.page,
+                         apps: &apps, groups: &groups)
+            } else {
                 compactFolderMembers(&apps, folderID: sourceGroupID)
             }
         }

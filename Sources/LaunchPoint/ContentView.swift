@@ -31,6 +31,7 @@ private final class SettingsPanelContainerView: NSView {
 
     func install(_ rootView: SettingsPanel) {
         let hostingView = NSHostingView(rootView: rootView)
+        hostingView.sizingOptions = []
         hostingView.translatesAutoresizingMaskIntoConstraints = false
         hostingView.wantsLayer = true
         addSubview(hostingView)
@@ -115,16 +116,17 @@ private struct MovableSettingsOverlay: View {
                         )
                     }
                 )
-                .frame(width: 560, height: 440)
-                .offset(offset)
+                .frame(width: min(SettingsPanel.preferredSize.width, max(1, geometry.size.width - 32)),
+                       height: min(SettingsPanel.preferredSize.height, max(1, geometry.size.height - 32)))
+                .offset(bounded(offset, in: geometry.size))
                 .transition(.opacity.combined(with: .scale(scale: 0.985)))
             }
         }
     }
 
     private func bounded(_ candidate: CGSize, in viewport: CGSize) -> CGSize {
-        let maxX = max(0, (viewport.width - 560) / 2 - 16)
-        let maxY = max(0, (viewport.height - 440) / 2 - 16)
+        let maxX = max(0, (viewport.width - SettingsPanel.preferredSize.width) / 2 - 16)
+        let maxY = max(0, (viewport.height - SettingsPanel.preferredSize.height) / 2 - 16)
         return CGSize(width: min(max(candidate.width, -maxX), maxX),
                       height: min(max(candidate.height, -maxY), maxY))
     }
@@ -202,6 +204,7 @@ struct ContentView: View {
     // MARK: 拖拽排序状态(网格内:应用或文件夹图块)
     @State private var draggingEntry: PageEntry?
     @State private var dragLocation: CGPoint = .zero       // "pagingArea" 坐标
+    @State private var dragGrabOffset: CGSize = .zero
     @State private var dropTarget: DropTarget?
     @State private var dragOrigin: OriginCell?             // 起拖格
     @State private var hasLeftOrigin = false               // 指针是否已离开起拖格
@@ -211,6 +214,7 @@ struct ContentView: View {
     @State private var edgeFlipDirection = 0
     @State private var pagingAreaFrame: CGRect = .zero     // 分页容器的窗口坐标 frame
     @State private var previewPages: [[PageEntry]]?
+    @State private var dragBasePages: [[PageEntry]]?
 
     // MARK: 从文件夹面板拖出
     @State private var panelDragApp: AppItem?              // 面板内起拖的应用
@@ -225,8 +229,11 @@ struct ContentView: View {
     @State private var verticalDragLocation: CGPoint = .zero
     @State private var verticalDropTarget: ScrollingDropTarget?
     @State private var scrollingPreviewEntries: [PageEntry]?
+    @State private var scrollingDragBaseEntries: [PageEntry]?
     @State private var scrollingViewportFrame: CGRect = .zero
     @State private var lastVerticalAutoScroll = Date.distantPast
+    @State private var lastPagingDragUpdate: TimeInterval = 0
+    @State private var lastVerticalDragUpdate: TimeInterval = 0
 
     private var draggingID: String? {
         draggingEntry?.id ?? verticalDraggingEntry?.id ?? panelDragApp?.id
@@ -269,6 +276,24 @@ struct ContentView: View {
     /// onto 模式下被悬停的条目(视觉放大提示)。
     private var ontoHighlightID: String? {
         if case .onto(_, let id) = dropTarget { return id }
+        return nil
+    }
+
+    private var insertionMarker: some View {
+        Capsule().fill(AppTheme.blue)
+            .frame(width: 3, height: gridIconSize)
+            .allowsHitTesting(false)
+    }
+
+    private var pagedInsertionAnchor: (id: String, after: Bool)? {
+        guard case .insert = dropTarget,
+              let source = draggingEntry,
+              let previewPages else { return nil }
+        for page in previewPages {
+            guard let sourceIndex = page.firstIndex(where: { $0.id == source.id }) else { continue }
+            if sourceIndex + 1 < page.count { return (page[sourceIndex + 1].id, false) }
+            if sourceIndex > 0 { return (page[sourceIndex - 1].id, true) }
+        }
         return nil
     }
 
@@ -378,7 +403,7 @@ struct ContentView: View {
 
     /// 展示用页面:拖拽时用预览布局,并在末尾提供一个空承接页。
     private var displayPages: [[PageEntry]] {
-        if let previewPages { return previewPages }
+        // Keep the gesture's source view and hit targets in stable slots until drop.
         if state.showSettings {
             let entries = store.pages.flatMap { $0 }
             let capacity = max(1, state.gridColumns * state.gridRows)
@@ -395,7 +420,7 @@ struct ContentView: View {
     /// 连续模式只展示已落盘的条目。它不参与分页拖拽，因此不应因拖拽预览
     /// 多出一个空白承接页，也不应让临时重排状态影响滚动内容。
     private var scrollingEntries: [PageEntry] {
-        scrollingPreviewEntries ?? store.pages.flatMap { $0 }
+        scrollingDragBaseEntries ?? store.pages.flatMap { $0 }
     }
 
     /// 搜索结果:前缀/词首/首字母/缩写/拼音多路匹配,按匹配度排序。
@@ -895,7 +920,8 @@ struct ContentView: View {
                         Group {
                             // 只构建当前页及相邻页。大量应用时不再因图标缩放或
                             // hover 让十几页离屏 NSImage 一起参与布局。
-                            if draggingEntry != nil || abs(pageIndex - state.currentPage) <= 1 {
+                            if abs(pageIndex - state.currentPage) <= 1
+                                || displayPages[pageIndex].contains(where: { $0.id == draggingEntry?.id }) {
                                 pageView(displayPages[pageIndex], width: width)
                             } else {
                                 Color.clear
@@ -910,7 +936,8 @@ struct ContentView: View {
                 // 跟随指针的浮动图标(拖拽中)
                 if let entry = draggingEntry {
                     floatingIcon(entry)
-                        .position(dragLocation)
+                        .position(x: dragLocation.x - dragGrabOffset.width,
+                                  y: dragLocation.y - dragGrabOffset.height)
                         .allowsHitTesting(false)
                         .zIndex(10)
                 }
@@ -948,6 +975,7 @@ struct ContentView: View {
                     }
                     .background(Color.black.opacity(0.001))
                     .contentShape(Rectangle())
+                    .scrollDisabled(verticalDraggingEntry != nil || panelDragApp != nil)
                     .onTapGesture { dismissBlankArea() }
                     .contextMenu { blankAreaMenu }
 
@@ -955,6 +983,7 @@ struct ContentView: View {
                         floatingIcon(entry)
                             .position(x: verticalDragLocation.x - scrollingViewportFrame.minX,
                                       y: verticalDragLocation.y - scrollingViewportFrame.minY)
+                            .offset(x: -dragGrabOffset.width, y: -dragGrabOffset.height)
                             .allowsHitTesting(false)
                             .zIndex(20)
                     } else if let app = panelDragApp, folderPanelHidden {
@@ -970,8 +999,7 @@ struct ContentView: View {
                 .onAppear { updateScrollingViewport(geo) }
                 .onChange(of: geo.size) { _, _ in updateScrollingViewport(geo) }
                 .onPreferenceChange(ScrollingEntryFrameKey.self) { frames in
-                    guard (verticalDraggingEntry != nil || panelDragApp != nil),
-                          frames != scrollingEntryFrames else { return }
+                    guard frames != scrollingEntryFrames else { return }
                     scrollingEntryFrames = frames
                     if let source = verticalDraggingEntry {
                         updateVerticalTarget(at: verticalDragLocation, source: source)
@@ -988,22 +1016,44 @@ struct ContentView: View {
 
     private func scrollingEntryCell(_ entry: PageEntry,
                                     scrollProxy: ScrollViewProxy) -> some View {
-        entryCell(entry, allowsReordering: false)
+        entryCell(entry, allowsReordering: false, handlesTap: false)
+            .frame(width: gridCellWidth, height: gridCellHeight)
             .opacity(draggingID == entry.id ? 0.28 : 1)
-            .scaleEffect(scrollingDropTargetID == entry.id ? 1.045 : 1)
             .zIndex(scrollingDropTargetID == entry.id ? 1 : 0)
-            .simultaneousGesture(verticalDragGesture(entry, scrollProxy: scrollProxy))
-            .background {
-                if verticalDraggingEntry != nil || panelDragApp != nil {
-                    GeometryReader { geometry in
-                        Color.clear.preference(
-                            key: ScrollingEntryFrameKey.self,
-                            value: [entry.id: geometry.frame(in: .global)]
-                        )
-                    }
+            .overlay(alignment: .leading) {
+                if let target = verticalDropTarget ?? panelScrollingTarget,
+                   target.entryID == entry.id, target.zone == .before {
+                    insertionMarker.offset(x: -5)
                 }
             }
-            .animation(.easeOut(duration: 0.14), value: scrollingDropTargetID == entry.id)
+            .overlay(alignment: .trailing) {
+                if let target = verticalDropTarget ?? panelScrollingTarget,
+                   target.entryID == entry.id, target.zone == .after {
+                    insertionMarker.offset(x: 5)
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                if scrollingDropTargetID == entry.id,
+                   verticalDropTarget?.zone == .group || panelScrollingTarget?.zone == .group {
+                    Image(systemName: "folder.badge.plus")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(AppTheme.blue)
+                        .padding(6)
+                        .background(.regularMaterial, in: Circle())
+                        .overlay(Circle().stroke(AppTheme.blue.opacity(0.24), lineWidth: 1))
+                        .shadow(color: AppTheme.blue.opacity(0.2), radius: 5, y: 2)
+                        .allowsHitTesting(false)
+                }
+            }
+            .highPriorityGesture(verticalDragGesture(entry, scrollProxy: scrollProxy))
+            .background {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: ScrollingEntryFrameKey.self,
+                        value: [entry.id: geometry.frame(in: .global)]
+                    )
+                }
+            }
     }
 
     private func scrollingDropZone(at location: CGPoint,
@@ -1016,46 +1066,70 @@ struct ContentView: View {
         if inCenter, case .app = source {
             return .group
         }
-        return location.y < height / 2 ? .before : .after
+        // The list is row-major: left/right, not top/bottom, determines insertion.
+        return location.x < width / 2 ? .before : .after
     }
 
     private func verticalDragGesture(_ entry: PageEntry,
                                      scrollProxy: ScrollViewProxy) -> some Gesture {
-        LongPressGesture(minimumDuration: 0.18, maximumDistance: 7)
-            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global))
-            .onChanged { phase in
+        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+            .onChanged { drag in
                 guard !AppState.shared.dragInhibited else { return }
-                guard case .second(true, let drag) = phase, let drag else { return }
                 if verticalDraggingEntry == nil {
+                    if let frame = scrollingEntryFrames[entry.id] {
+                        dragGrabOffset = CGSize(width: drag.startLocation.x - frame.midX,
+                                                height: drag.startLocation.y - frame.midY)
+                    } else { dragGrabOffset = .zero }
                     verticalDraggingEntry = entry
-                    scrollingPreviewEntries = store.pages.flatMap { $0 }
+                    let base = store.pages.flatMap { $0 }
+                    scrollingDragBaseEntries = base
+                    scrollingPreviewEntries = base
                     hoveredEntryID = nil
                     AppState.shared.isDragging = true
                 }
+                let now = ProcessInfo.processInfo.systemUptime
+                guard now - lastVerticalDragUpdate >= (1.0 / 60.0) else { return }
+                lastVerticalDragUpdate = now
                 verticalDragLocation = drag.location
                 updateVerticalTarget(at: drag.location, source: entry)
                 autoScrollVertically(at: drag.location, proxy: scrollProxy)
             }
-            .onEnded { phase in
+            .onEnded { drag in
                 AppState.shared.dragInhibited = false
-                guard case .second(true, let drag) = phase, drag != nil else {
-                    if verticalDraggingEntry?.id == entry.id { finishVerticalDrag() }
-                    return
+                guard verticalDraggingEntry?.id == entry.id else { return }
+                if hypot(drag.translation.width, drag.translation.height) < 3 {
+                    finishVerticalDrag()
+                    activate(entry)
+                } else {
+                    // Commit the exact anchor represented by the visible blue marker.
+                    // onEnded can report a slightly shifted final location; resolving it
+                    // again here changed the anchor without giving SwiftUI a frame to draw
+                    // the new marker, so the persisted item landed one slot too early.
+                    if verticalDropTarget == nil {
+                        verticalDragLocation = drag.location
+                        updateVerticalTarget(at: drag.location, source: entry)
+                    }
+                    commitVerticalDrag()
                 }
-                commitVerticalDrag()
             }
     }
 
     private func updateVerticalTarget(at location: CGPoint, source: PageEntry) {
-        let candidates = scrollingEntryFrames
+        if scrollingEntryFrames[source.id]?.contains(location) == true {
+            verticalDropTarget = nil
+            scrollingDropTargetID = nil
+            return
+        }
+        let match = scrollingEntryFrames
             .filter { $0.key != source.id }
-            .sorted { lhs, rhs in
+            .min { lhs, rhs in
                 let left = pow(lhs.value.midX - location.x, 2) + pow(lhs.value.midY - location.y, 2)
                 let right = pow(rhs.value.midX - location.x, 2) + pow(rhs.value.midY - location.y, 2)
                 return left < right
             }
-        guard let match = candidates.first,
-              let target = store.pages.flatMap({ $0 }).first(where: { $0.id == match.key }) else {
+        let baseEntries = scrollingDragBaseEntries ?? store.pages.flatMap { $0 }
+        guard let match,
+              let target = baseEntries.first(where: { $0.id == match.key }) else {
             return
         }
 
@@ -1063,7 +1137,7 @@ struct ContentView: View {
                             y: location.y - match.value.minY)
         var zone = scrollingDropZone(at: local, size: match.value.size, source: source)
         if !match.value.insetBy(dx: -8, dy: -8).contains(location), zone == .group {
-            zone = location.y < match.value.midY ? .before : .after
+            zone = location.x < match.value.midX ? .before : .after
         }
         let next = ScrollingDropTarget(entryID: target.id, zone: zone)
         guard next != verticalDropTarget else { return }
@@ -1071,17 +1145,18 @@ struct ContentView: View {
         scrollingDropTargetID = zone == .group ? target.id : nil
 
         let preview = scrollingPreview(source: source, target: target, zone: zone)
-        withAnimation(.interactiveSpring(response: 0.17, dampingFraction: 0.9)) {
-            scrollingPreviewEntries = preview
-        }
+        scrollingPreviewEntries = preview
     }
 
     private func scrollingPreview(source: PageEntry,
                                   target: PageEntry,
                                   zone: ScrollingDropZone) -> [PageEntry] {
-        var entries = store.pages.flatMap { $0 }.filter { $0.id != source.id }
-        guard zone != .group,
-              let targetIndex = entries.firstIndex(where: { $0.id == target.id }) else {
+        var entries = scrollingDragBaseEntries ?? store.pages.flatMap { $0 }
+        // 建夹/入夹预览不移除源视图。源视图一旦从 ForEach 消失，
+        // SwiftUI 可能中断它的 DragGesture，导致松手回调丢失、拖动状态卡住。
+        guard zone != .group else { return entries }
+        entries.removeAll { $0.id == source.id }
+        guard let targetIndex = entries.firstIndex(where: { $0.id == target.id }) else {
             return entries
         }
         entries.insert(source, at: targetIndex + (zone == .after ? 1 : 0))
@@ -1111,10 +1186,8 @@ struct ContentView: View {
         guard let anchorIndex else { return }
         let destination = min(max(anchorIndex + direction * max(1, gridColumnCount), 0),
                               ordered.count - 1)
-        withAnimation(.linear(duration: 0.08)) {
-            proxy.scrollTo(ordered[destination].id,
-                           anchor: direction < 0 ? .top : .bottom)
-        }
+        proxy.scrollTo(ordered[destination].id,
+                       anchor: direction < 0 ? .top : .bottom)
     }
 
     private func commitVerticalDrag() {
@@ -1125,16 +1198,18 @@ struct ContentView: View {
             return
         }
         scrollingPreviewEntries = nil
+        scrollingDragBaseEntries = nil
         performScrollingDrop(source: source, onto: target, zone: targetInfo.zone)
         finishVerticalDrag()
     }
 
     private func finishVerticalDrag() {
+        dragGrabOffset = .zero
         verticalDraggingEntry = nil
         verticalDropTarget = nil
         scrollingPreviewEntries = nil
+        scrollingDragBaseEntries = nil
         scrollingDropTargetID = nil
-        scrollingEntryFrames = [:]
         AppState.shared.isDragging = false
     }
 
@@ -1210,10 +1285,32 @@ struct ContentView: View {
         LazyVGrid(columns: gridColumns, spacing: gridRowSpacing) {
             ForEach(entries) { entry in
                 entryCell(entry)
-                    // onto 悬停:目标条目放大提示"松手即建夹/入夹"
-                    .scaleEffect(ontoHighlightID == entry.id ? 1.07 : 1)
-                    .animation(.spring(response: 0.2, dampingFraction: 0.86),
-                               value: ontoHighlightID == entry.id)
+                    .frame(width: gridCellWidth, height: gridCellHeight)
+                    .overlay(alignment: .leading) {
+                        if let target = pagedInsertionAnchor,
+                           target.id == entry.id, !target.after {
+                            insertionMarker.offset(x: -5)
+                        }
+                    }
+                    .overlay(alignment: .trailing) {
+                        if let target = pagedInsertionAnchor,
+                           target.id == entry.id, target.after {
+                            insertionMarker.offset(x: 5)
+                        }
+                    }
+                    // onto 只显示静态落点提示，避免放大动画与最终槽位产生视觉偏差。
+                    .overlay(alignment: .topTrailing) {
+                        if draggingEntry != nil && ontoHighlightID == entry.id {
+                            Image(systemName: "folder.badge.plus")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(AppTheme.blue)
+                                .padding(6)
+                                .background(.regularMaterial, in: Circle())
+                                .overlay(Circle().stroke(AppTheme.blue.opacity(0.24), lineWidth: 1))
+                                .shadow(color: AppTheme.blue.opacity(0.2), radius: 5, y: 2)
+                                .allowsHitTesting(false)
+                        }
+                    }
             }
         }
         .frame(width: gridContentWidth)
@@ -1222,25 +1319,27 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private func entryCell(_ entry: PageEntry, allowsReordering: Bool = true) -> some View {
+    private func entryCell(_ entry: PageEntry,
+                           allowsReordering: Bool = true,
+                           handlesTap: Bool = true) -> some View {
         Group {
             switch entry {
             case .app(let app):
                 if allowsReordering {
-                    appCell(app)
+                    appCell(app, handlesTap: false)
                         // 拖拽中的条目在预览槽位处半透明显示,作为落点指示
                         .opacity(app.id == draggingID ? 0.35 : 1)
-                        .gesture(iconDragGesture(entry))
+                        .highPriorityGesture(iconDragGesture(entry))
                 } else {
-                    appCell(app)
+                    appCell(app, handlesTap: handlesTap)
                 }
             case .folder(let info):
                 if allowsReordering {
-                    folderCell(info)
+                    folderCell(info, handlesTap: false)
                         .opacity(info.id == draggingID ? 0.35 : 1)
-                        .gesture(iconDragGesture(entry))   // 文件夹图块同样可拖动排序
+                        .highPriorityGesture(iconDragGesture(entry))   // 文件夹图块同样可拖动排序
                 } else {
-                    folderCell(info)
+                    folderCell(info, handlesTap: handlesTap)
                 }
             }
         }
@@ -1249,8 +1348,9 @@ struct ContentView: View {
     // MARK: - 文件夹
 
     /// 文件夹图块:托盘 + 2×2 成员预览 + 名称。
-    private func folderCell(_ info: FolderInfo) -> some View {
-        VStack(spacing: 8) {
+    @ViewBuilder
+    private func folderCell(_ info: FolderInfo, handlesTap: Bool = true) -> some View {
+        let cell = VStack(spacing: 8) {
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
                                 GridItem(.flexible(), spacing: 6)], spacing: 6) {
                 ForEach(0..<4, id: \.self) { i in
@@ -1289,13 +1389,19 @@ struct ContentView: View {
                 y: hoveredEntryID == info.id ? 5 : 0)
         .zIndex(hoveredEntryID == info.id ? 2 : 0)
         .contentShape(Rectangle())
-        .onTapGesture { state.openFolder(info.id) }
         .onHover { inside in
             guard !AppState.shared.isDragging else { return }
             hoveredEntryID = inside ? info.id : nil
         }
-        .animation(.spring(response: 0.18, dampingFraction: 0.82), value: cellScale(for: info.id))
+        .animation(AppState.shared.isDragging
+                   ? nil : .spring(response: 0.18, dampingFraction: 0.82),
+                   value: cellScale(for: info.id))
         .contextMenu { folderContextMenu(info) }
+        if handlesTap {
+            cell.onTapGesture { state.openFolder(info.id) }
+        } else {
+            cell
+        }
     }
 
     /// 文件夹展开面板:标题可点击改名,成员网格,点外部/Esc 关闭,可解散。
@@ -1315,9 +1421,9 @@ struct ContentView: View {
                                              count: min(5, max(members.count, 1))),
                               spacing: 22) {
                         ForEach(members) { app in
-                            appCell(app)
+                            appCell(app, handlesTap: false)
                                 .opacity(app.id == panelDragApp?.id ? 0.35 : 1)
-                                .gesture(panelDragGesture(app))   // 按住拖出文件夹
+                                .highPriorityGesture(panelDragGesture(app))   // 直接拖出文件夹
                         }
                     }
                     .padding(.horizontal, 34)
@@ -1353,7 +1459,7 @@ struct ContentView: View {
 
     /// 从文件夹面板内拖出:指针越出面板边界 → 面板隐去(视图保留),转入网格拖拽管线。
     private func panelDragGesture(_ app: AppItem) -> some Gesture {
-        DragGesture(minimumDistance: 6, coordinateSpace: .global)
+        DragGesture(minimumDistance: 0, coordinateSpace: .global)
             .onChanged { value in
                 guard !AppState.shared.dragInhibited else { return }
                 if panelDragApp == nil {
@@ -1366,7 +1472,7 @@ struct ContentView: View {
                     // 仍在面板内:只跟随浮动图标
                     guard panelFrame != .zero, !panelFrame.contains(value.location) else { return }
                     // 越出边界:面板隐去,接入网格拖拽管线(跳过起拖格保护)
-                    withAnimation(.easeOut(duration: 0.18)) { folderPanelHidden = true }
+                    folderPanelHidden = true
                     if state.viewMode == .scrolling {
                         updatePanelScrollingTarget(at: value.location, source: app)
                         return
@@ -1384,33 +1490,43 @@ struct ContentView: View {
                 evaluateDragTarget()
                 handleEdgeHover()
             }
-            .onEnded { _ in
+            .onEnded { drag in
                 AppState.shared.dragInhibited = false
                 let didLeavePanel = folderPanelHidden
                 if didLeavePanel {
                     if state.viewMode == .scrolling {
+                        // Keep the anchor already shown by the insertion marker. Only
+                        // resolve at release when no drag update produced a target.
+                        if panelScrollingTarget == nil {
+                            updatePanelScrollingTarget(at: drag.location, source: app)
+                        }
                         commitPanelScrollingDrag(app)
                         state.closeFolder()
                         return
                     }
+                    dragLocation = CGPoint(x: drag.location.x - pagingAreaFrame.minX,
+                                           y: drag.location.y - pagingAreaFrame.minY)
+                    evaluateDragTarget()
                     commitDrag()                     // 含 finishDrag(清 panel 状态)
                     state.closeFolder()              // 拖出后关闭面板(可能已自动解散)
                 } else {
-                    // 未离开面板:无操作
+                    let shouldLaunch = hypot(drag.translation.width,
+                                             drag.translation.height) < 3
                     AppState.shared.dragInhibited = false
                     panelDragApp = nil
                     AppState.shared.isDragging = false
+                    if shouldLaunch { launch(app) }
                 }
             }
     }
 
     private func updatePanelScrollingTarget(at location: CGPoint, source: AppItem) {
-        let matches = scrollingEntryFrames.sorted { lhs, rhs in
+        let match = scrollingEntryFrames.min { lhs, rhs in
             let left = pow(lhs.value.midX - location.x, 2) + pow(lhs.value.midY - location.y, 2)
             let right = pow(rhs.value.midX - location.x, 2) + pow(rhs.value.midY - location.y, 2)
             return left < right
         }
-        guard let match = matches.first,
+        guard let match,
         let target = store.pages.flatMap({ $0 }).first(where: { $0.id == match.key }) else {
             panelScrollingTarget = nil
             scrollingDropTargetID = nil
@@ -1426,11 +1542,9 @@ struct ContentView: View {
         guard next != panelScrollingTarget else { return }
         panelScrollingTarget = next
         scrollingDropTargetID = zone == .group ? target.id : nil
-        withAnimation(.interactiveSpring(response: 0.17, dampingFraction: 0.9)) {
-            scrollingPreviewEntries = scrollingPreview(source: .app(source),
-                                                        target: target,
-                                                        zone: zone)
-        }
+        scrollingPreviewEntries = scrollingPreview(source: .app(source),
+                                                    target: target,
+                                                    zone: zone)
     }
 
     private func commitPanelScrollingDrag(_ app: AppItem) {
@@ -1490,23 +1604,63 @@ struct ContentView: View {
     // MARK: - 图标拖拽排序
 
     private func iconDragGesture(_ entry: PageEntry) -> some Gesture {
-        DragGesture(minimumDistance: 6, coordinateSpace: .global)
+        DragGesture(minimumDistance: 0, coordinateSpace: .global)
             .onChanged { value in
                 guard state.effectiveQuery.isEmpty,
                       state.openFolderID == nil else { return }   // 搜索态/文件夹展开不排序
                 dragChanged(entry, value)
             }
-            .onEnded { _ in
-                commitDrag()
+            .onEnded { value in
+                guard draggingEntry?.id == entry.id, !AppState.shared.dragInhibited else {
+                    finishDrag()
+                    return
+                }
+                if hypot(value.translation.width, value.translation.height) < 3 {
+                    finishDrag()
+                    activate(entry)
+                } else {
+                    // Commit the target that was actually shown to the user.
+                    // SwiftUI can deliver a slightly shifted final location in
+                    // onEnded; recalculating here made the item land one slot
+                    // before the visible insertion marker.
+                    if dropTarget == nil {
+                        dragLocation = CGPoint(x: value.location.x - pagingAreaFrame.minX,
+                                               y: value.location.y - pagingAreaFrame.minY)
+                        evaluateDragTarget()
+                    }
+                    commitDrag()
+                }
             }
+    }
+
+    private func activate(_ entry: PageEntry) {
+        switch entry {
+        case .app(let app):
+            launch(app)
+        case .folder(let info):
+            state.openFolder(info.id)
+        }
     }
 
     private func dragChanged(_ entry: PageEntry, _ value: DragGesture.Value) {
         guard !AppState.shared.dragInhibited else { return }   // 本次按住已被 Esc 取消
         let location = CGPoint(x: value.location.x - pagingAreaFrame.minX,
                                y: value.location.y - pagingAreaFrame.minY)
+        let isStarting = draggingEntry == nil
         if draggingEntry == nil {
+            let start = CGPoint(x: value.startLocation.x - pagingAreaFrame.minX,
+                                y: value.startLocation.y - pagingAreaFrame.minY)
+            if store.pages.indices.contains(state.currentPage),
+               let index = store.pages[state.currentPage].firstIndex(where: { $0.id == entry.id }) {
+                let center = CGPoint(
+                    x: gridLeadingX(pageWidth: containerWidth) + CGFloat(index % gridColumnCount)
+                        * (gridCellWidth + gridColumnSpacing) + gridCellWidth / 2,
+                    y: Self.gridTop + CGFloat(index / gridColumnCount)
+                        * (gridCellHeight + gridRowSpacing) + gridCellHeight / 2)
+                dragGrabOffset = CGSize(width: start.x - center.x, height: start.y - center.y)
+            } else { dragGrabOffset = .zero }
             draggingEntry = entry
+            dragBasePages = basePagesWithoutDragged(entry)
             hoveredEntryID = nil
             AppState.shared.isDragging = true
             hasLeftOrigin = false
@@ -1518,6 +1672,9 @@ struct ContentView: View {
                 dragOrigin = nil
             }
         }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard isStarting || now - lastPagingDragUpdate >= (1.0 / 60.0) else { return }
+        lastPagingDragUpdate = now
         dragLocation = location
         evaluateDragTarget()
         handleEdgeHover()
@@ -1568,17 +1725,28 @@ struct ContentView: View {
             hasLeftOrigin = true
         }
 
-        let base = basePagesWithoutDragged(entry)
+        let base = dragBasePages ?? basePagesWithoutDragged(entry)
 
         // 悬停在某条目中心区 → 建夹(应用)或入夹(文件夹);仅应用可触发
         if case .app = entry,
-           pageIndex < base.count,
-           let hit = ontoHit(xInPage: xInPage, y: dragLocation.y, entries: base[pageIndex]) {
+           pageIndex < store.pages.count,
+           let hit = ontoHit(xInPage: xInPage, y: dragLocation.y, entries: store.pages[pageIndex]),
+           hit.id != entry.id {
             setDropTarget(.onto(page: pageIndex, entryID: hit.id), entry: entry, base: base)
             return
         }
 
-        let slot = insertionSlot(xInPage: xInPage, y: dragLocation.y)
+        if pageIndex < store.pages.count,
+           let index = cellIndex(xInPage: xInPage, y: dragLocation.y),
+           index < store.pages[pageIndex].count,
+           store.pages[pageIndex][index].id == entry.id {
+            dropTarget = nil
+            return
+        }
+
+        let visibleSlot = insertionSlot(xInPage: xInPage, y: dragLocation.y)
+        let displayed = pageIndex < store.pages.count ? store.pages[pageIndex] : []
+        let slot = displayed.prefix(visibleSlot).filter { $0.id != entry.id }.count
         setDropTarget(.insert(page: pageIndex, slot: slot), entry: entry, base: base)
     }
 
@@ -1642,15 +1810,14 @@ struct ContentView: View {
                 pageIndex += 1
             }
         case .onto:
-            break
+            // 同上：保留源图标在原位，避免目标中心区的反馈重建源视图。
+            preview = store.pages
         }
         while preview.count > 1, preview.last?.isEmpty == true,
               preview.count > store.pages.count + 1 {
             preview.removeLast()
         }
-        withAnimation(.interactiveSpring(response: 0.17, dampingFraction: 0.9)) {
-            previewPages = preview
-        }
+        previewPages = preview
     }
 
     /// 拖到页面左右边缘短暂停留后自动翻页；停在边缘可连续跨页。
@@ -1694,11 +1861,7 @@ struct ContentView: View {
         let lastPage = max(0, displayPages.count - 1)
         let destination = min(max(state.currentPage + direction, 0), lastPage)
         if destination != state.currentPage {
-            withAnimation(.interactiveSpring(response: 0.18,
-                                             dampingFraction: 0.92,
-                                             blendDuration: 0.02)) {
-                state.currentPage = destination
-            }
+            state.currentPage = destination
         }
         evaluateDragTarget()
     }
@@ -1706,20 +1869,22 @@ struct ContentView: View {
     private func commitDrag() {
         AppState.shared.dragInhibited = false    // 一次按住结束
         if let entry = draggingEntry, let target = dropTarget {
-            withAnimation(.interactiveSpring(response: 0.24, dampingFraction: 0.9)) {
-                switch target {
-                case .insert(let page, let slot):
+            switch target {
+            case .insert(let page, let slot):
+                if let previewPages {
+                    store.moveEntryToMatchPreview(entry.id, preview: previewPages)
+                } else {
                     store.moveEntry(entry.id, toPage: page, slot: slot)
-                case .onto(_, let targetID):
-                    // 只有拖应用才会产生 onto 落点(evaluateDragTarget 保证)
-                    if case .app(let app) = entry {
-                        if store.isFolderID(targetID) {
-                            store.addToFolder(app.id, folderID: targetID)
-                        } else if targetID != app.id {
-                            store.createFolder(dragging: app.id,
-                                               onto: targetID,
-                                               name: "未命名文件夹")
-                        }
+                }
+            case .onto(_, let targetID):
+                // 只有拖应用才会产生 onto 落点(evaluateDragTarget 保证)
+                if case .app(let app) = entry {
+                    if store.isFolderID(targetID) {
+                        store.addToFolder(app.id, folderID: targetID)
+                    } else if targetID != app.id {
+                        store.createFolder(dragging: app.id,
+                                           onto: targetID,
+                                           name: "未命名文件夹")
                     }
                 }
             }
@@ -1733,8 +1898,10 @@ struct ContentView: View {
         edgeFlipWork = nil
         edgeFlipDirection = 0
         draggingEntry = nil
+        dragGrabOffset = .zero
         dropTarget = nil
         previewPages = nil
+        dragBasePages = nil
         dragOrigin = nil
         hasLeftOrigin = false
         panelDragApp = nil
@@ -1743,6 +1910,8 @@ struct ContentView: View {
         scrollingEntryFrames = [:]
         scrollingPreviewEntries = nil
         folderPanelHidden = false
+        lastPagingDragUpdate = 0
+        lastVerticalDragUpdate = 0
         finishVerticalDrag()
         AppState.shared.isDragging = false
         state.currentPage = min(state.currentPage, max(0, store.pages.count - 1))
@@ -1790,15 +1959,16 @@ struct ContentView: View {
                 }
             }
         }
-        .scaleEffect(1.15)
+        .frame(width: gridCellWidth, height: gridCellHeight)
         .shadow(color: .black.opacity(0.35), radius: 14, y: 6)
     }
 
     /// 单元格:普通视图 + TapGesture 启动。
     /// 不能用 Button:macOS 上 Button 的按压手势会把外层 DragGesture 的回调
     /// 全部推迟到松手时一次性爆发,实时拖拽彻底失效(已实测证实)。
-    private func appCell(_ app: AppItem) -> some View {
-        VStack(spacing: 8) {
+    @ViewBuilder
+    private func appCell(_ app: AppItem, handlesTap: Bool = true) -> some View {
+        let cell = VStack(spacing: 8) {
             Image(nsImage: app.icon)
                 .resizable()
                 .interpolation(.medium)
@@ -1825,16 +1995,23 @@ struct ContentView: View {
                 y: hoveredEntryID == app.id ? 5 : 0)
         .zIndex(hoveredEntryID == app.id ? 2 : 0)
         .contentShape(Rectangle())
-        .onTapGesture { launch(app) }
         .onHover { inside in
             guard !AppState.shared.isDragging else { return }
             hoveredEntryID = inside ? app.id : nil
         }
-        .animation(.spring(response: 0.18, dampingFraction: 0.82), value: cellScale(for: app.id))
+        .animation(AppState.shared.isDragging
+                   ? nil : .spring(response: 0.18, dampingFraction: 0.82),
+                   value: cellScale(for: app.id))
         .contextMenu { appContextMenu(app) }
+        if handlesTap {
+            cell.onTapGesture { launch(app) }
+        } else {
+            cell
+        }
     }
 
     private func cellScale(for entryID: String) -> CGFloat {
+        guard !AppState.shared.isDragging else { return 1 }
         if hoveredEntryID == entryID { return 1.075 }
         if state.highlightedAppID == entryID { return 1.035 }
         return 1

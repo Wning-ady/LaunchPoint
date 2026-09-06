@@ -60,8 +60,7 @@ enum AppScanner {
             } else {
                 let loaded = descriptor.resourceURL.flatMap(NSImage.init(contentsOf:))
                     ?? workspace.icon(forFile: fullPath)
-                icon = (loaded.copy() as? NSImage) ?? loaded
-                icon.size = iconDisplaySize
+                icon = normalizedIcon(loaded)
                 iconCache.setObject(icon, forKey: descriptor.cacheKey)
             }
             items.append(
@@ -148,6 +147,95 @@ enum AppScanner {
         return plist as? [String: Any]
     }
 
+    /// Normalize the visible artwork rather than the source canvas. Legacy
+    /// icons often contain very different transparent margins, which makes
+    /// equal SwiftUI frames look noticeably larger or smaller in the grid.
+    private static func normalizedIcon(_ source: NSImage) -> NSImage {
+        let sampleSide = 256
+        var proposedRect = NSRect(x: 0, y: 0, width: sampleSide, height: sampleSide)
+        guard let sourceImage = source.cgImage(
+            forProposedRect: &proposedRect,
+            context: nil,
+            hints: [.interpolation: NSImageInterpolation.high.rawValue]
+        ) else {
+            let fallback = (source.copy() as? NSImage) ?? source
+            fallback.size = iconDisplaySize
+            return fallback
+        }
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue
+            | CGImageAlphaInfo.premultipliedLast.rawValue
+        guard let scanContext = CGContext(
+            data: nil,
+            width: sampleSide,
+            height: sampleSide,
+            bitsPerComponent: 8,
+            bytesPerRow: sampleSide * 4,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else { return NSImage(cgImage: sourceImage, size: iconDisplaySize) }
+        scanContext.interpolationQuality = .high
+        scanContext.draw(sourceImage, in: CGRect(x: 0, y: 0,
+                                                 width: sampleSide, height: sampleSide))
+
+        guard let bytes = scanContext.data?.assumingMemoryBound(to: UInt8.self) else {
+            return NSImage(cgImage: sourceImage, size: iconDisplaySize)
+        }
+        var minX = sampleSide
+        var minY = sampleSide
+        var maxX = -1
+        var maxY = -1
+        let alphaThreshold: UInt8 = 8
+        for y in 0..<sampleSide {
+            for x in 0..<sampleSide where bytes[(y * sampleSide + x) * 4 + 3] >= alphaThreshold {
+                minX = min(minX, x)
+                minY = min(minY, y)
+                maxX = max(maxX, x)
+                maxY = max(maxY, y)
+            }
+        }
+        guard maxX >= minX, maxY >= minY,
+              let raster = scanContext.makeImage() else {
+            return NSImage(cgImage: sourceImage, size: iconDisplaySize)
+        }
+
+        let margin = 2
+        minX = max(0, minX - margin)
+        minY = max(0, minY - margin)
+        maxX = min(sampleSide - 1, maxX + margin)
+        maxY = min(sampleSide - 1, maxY + margin)
+        let cropRect = CGRect(x: minX, y: minY,
+                              width: maxX - minX + 1,
+                              height: maxY - minY + 1)
+        guard let cropped = raster.cropping(to: cropRect),
+              let outputContext = CGContext(
+                data: nil,
+                width: sampleSide,
+                height: sampleSide,
+                bitsPerComponent: 8,
+                bytesPerRow: sampleSide * 4,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo
+              ) else {
+            return NSImage(cgImage: sourceImage, size: iconDisplaySize)
+        }
+
+        let targetSide = CGFloat(sampleSide) * 0.88
+        let scale = min(targetSide / cropRect.width, targetSide / cropRect.height)
+        let drawSize = CGSize(width: cropRect.width * scale, height: cropRect.height * scale)
+        let drawRect = CGRect(x: (CGFloat(sampleSide) - drawSize.width) / 2,
+                              y: (CGFloat(sampleSide) - drawSize.height) / 2,
+                              width: drawSize.width,
+                              height: drawSize.height)
+        outputContext.interpolationQuality = .high
+        outputContext.draw(cropped, in: drawRect)
+        guard let normalized = outputContext.makeImage() else {
+            return NSImage(cgImage: sourceImage, size: iconDisplaySize)
+        }
+        return NSImage(cgImage: normalized, size: iconDisplaySize)
+    }
+
     /// Prefer the app's declared icon resource. If a package declares a missing
     /// extension (for example .png while only the same-name .icns exists), try
     /// the sibling resource before falling back to NSWorkspace's generic icon.
@@ -229,9 +317,9 @@ enum AppScanner {
         return components.joined(separator: "|") as NSString
     }
 
-    /// Prefer the same localized name Finder shows for app bundles, then fall
-    /// back through bundle metadata and finally the file name. This keeps
-    /// built-in apps aligned with the current macOS language.
+    /// Prefer the localized bundle name for the user's language. Finder's
+    /// displayName often returns the English file name even when the bundle
+    /// ships a localized InfoPlist.strings, so it is deliberately a fallback.
     private static func localizedDisplayName(for url: URL) -> String {
         let isApplication = url.pathExtension.caseInsensitiveCompare("app") == .orderedSame
 
@@ -251,12 +339,58 @@ enum AppScanner {
         }
 
         let bundle = Bundle(url: url)
+        let spotlightName = cleaned(
+            NSMetadataItem(url: url)?.value(forAttribute: "kMDItemDisplayName") as? String
+        )
+        var localizedCandidates: [String?] = []
+        if let bundle {
+            var orderedLocalizations: [String] = []
+            func appendLocalization(_ requested: String) {
+                let normalized = requested.replacingOccurrences(of: "_", with: "-")
+                guard let match = bundle.localizations.first(where: {
+                    $0.replacingOccurrences(of: "_", with: "-")
+                        .caseInsensitiveCompare(normalized) == .orderedSame
+                }), !orderedLocalizations.contains(match) else { return }
+                orderedLocalizations.append(match)
+            }
+
+            Bundle.preferredLocalizations(
+                from: bundle.localizations,
+                forPreferences: Locale.preferredLanguages
+            ).forEach(appendLocalization)
+
+            for language in Locale.preferredLanguages {
+                appendLocalization(language)
+                let normalized = language.replacingOccurrences(of: "_", with: "-")
+                if normalized.lowercased().hasPrefix("zh-hans") {
+                    ["zh-Hans", "zh_CN", "zh-CN", "zh"].forEach(appendLocalization)
+                } else if normalized.lowercased().hasPrefix("zh-hant") {
+                    ["zh-Hant", "zh_TW", "zh-HK", "zh_HK", "zh"].forEach(appendLocalization)
+                } else if let languageCode = normalized.split(separator: "-").first {
+                    appendLocalization(String(languageCode))
+                }
+            }
+
+            for localization in orderedLocalizations {
+                guard let stringsURL = bundle.url(
+                    forResource: "InfoPlist",
+                    withExtension: "strings",
+                    subdirectory: nil,
+                    localization: localization
+                ), let data = try? Data(contentsOf: stringsURL),
+                   let dictionary = try? PropertyListSerialization.propertyList(
+                    from: data, options: [], format: nil
+                   ) as? [String: Any] else { continue }
+                localizedCandidates.append(cleaned(dictionary["CFBundleDisplayName"] as? String))
+                localizedCandidates.append(cleaned(dictionary["CFBundleName"] as? String))
+            }
+        }
         let localizedInfo = bundle?.localizedInfoDictionary
         let info = bundle?.infoDictionary
-        let candidates = [
-            finderName,
+        let candidates = [spotlightName] + localizedCandidates + [
             cleaned(localizedInfo?["CFBundleDisplayName"] as? String),
             cleaned(localizedInfo?["CFBundleName"] as? String),
+            finderName,
             cleaned(info?["CFBundleDisplayName"] as? String),
             cleaned(info?["CFBundleName"] as? String),
             cleaned(url.deletingPathExtension().lastPathComponent),
