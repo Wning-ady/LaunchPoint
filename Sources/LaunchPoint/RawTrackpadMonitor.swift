@@ -50,6 +50,21 @@ struct RawPinchDetector {
                 ($0.id, $0)
             })
             selectedPoints = sessionPointIDs.compactMap { pointsByID[$0] }
+            // Drivers can recycle one contact ID mid-gesture. Adopt a new
+            // touching contact instead of throwing away the accumulated
+            // scale history; this is especially common with four fingers.
+            if selectedPoints.count < expectedFingerCount {
+                let selectedIDs = Set(selectedPoints.map(\.id))
+                let replacements = identifiedPoints
+                    .filter { !selectedIDs.contains($0.id) }
+                    .sorted { $0.id < $1.id }
+                selectedPoints.append(contentsOf: replacements.prefix(
+                    expectedFingerCount - selectedPoints.count
+                ))
+                if selectedPoints.count == expectedFingerCount {
+                    sessionPointIDs = selectedPoints.map(\.id)
+                }
+            }
         }
 
         guard selectedPoints.count == expectedFingerCount else {
@@ -97,20 +112,22 @@ struct RawPinchDetector {
         let outwardRatio = smallestSpread > 0.10
             ? outwardDistance / smallestSpread
             : 0
-        let inwardProgress = min(max(inwardRatio / 0.10, 0), 1)
-        let outwardProgress = min(max(outwardRatio / 0.10, 0), 1)
+        let triggerRatio = expectedFingerCount == 4 ? 0.075 : 0.09
+        let triggerDistance = expectedFingerCount == 4 ? 0.012 : 0.016
+        let inwardProgress = min(max(inwardRatio / triggerRatio, 0), 1)
+        let outwardProgress = min(max(outwardRatio / triggerRatio, 0), 1)
         progress = inwardProgress >= outwardProgress ? inwardProgress : -outwardProgress
 
         guard stableFrameCount >= 2 else { return nil }
-        if inwardRatio >= 0.10,
-           inwardDistance >= 0.018,
+        if inwardRatio >= triggerRatio,
+           inwardDistance >= triggerDistance,
            !triggeredDirections.contains(.inward) {
             triggeredDirections.insert(.inward)
             progress = 1
             return .inward
         }
-        if outwardRatio >= 0.10,
-           outwardDistance >= 0.018,
+        if outwardRatio >= triggerRatio,
+           outwardDistance >= triggerDistance,
            !triggeredDirections.contains(.outward) {
             triggeredDirections.insert(.outward)
             progress = -1

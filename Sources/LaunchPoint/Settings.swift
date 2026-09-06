@@ -4,6 +4,131 @@ import Carbon.HIToolbox
 import ServiceManagement
 import UniformTypeIdentifiers
 
+/// A quiet, compact range control for the settings panel. The native macOS
+/// slider draws a dense tick rail for stepped values; this keeps the same
+/// binding semantics and accessibility actions while matching LaunchPoint's
+/// small, rounded control language.
+private struct CompactSlider: View {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let valueText: String
+    let accessibilityTitle: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            GeometryReader { geometry in
+                let trackWidth = max(1, geometry.size.width)
+                let fraction = min(max((value - range.lowerBound) /
+                                       (range.upperBound - range.lowerBound), 0), 1)
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(AppTheme.separator.opacity(0.72))
+                        .frame(height: 5)
+                    Capsule()
+                        .fill(AppTheme.blue)
+                        .frame(width: max(6, trackWidth * fraction), height: 5)
+                    Circle()
+                        .fill(AppTheme.paper)
+                        .frame(width: 20, height: 20)
+                        .overlay(Circle().stroke(AppTheme.separator, lineWidth: 1))
+                        .shadow(color: .black.opacity(0.12), radius: 2, y: 1)
+                        .offset(x: min(max(0, trackWidth * fraction - 10),
+                                      max(0, trackWidth - 20)))
+                }
+                .frame(height: 24)
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 0).onChanged { gesture in
+                    setValue(for: gesture.location.x, width: trackWidth)
+                })
+            }
+            .frame(minWidth: 180, idealWidth: 220, maxWidth: 260)
+            .frame(height: 24)
+
+            Text(valueText)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(AppTheme.secondaryText)
+                .frame(width: 42, alignment: .trailing)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityTitle)
+        .accessibilityValue(valueText)
+        .accessibilityAdjustableAction { direction in
+            let delta = direction == .increment ? step : -step
+            setValue(value + delta)
+        }
+    }
+
+    private func setValue(for x: CGFloat, width: CGFloat) {
+        guard width > 0 else { return }
+        let fraction = min(max(x / width, 0), 1)
+        let raw = range.lowerBound + (range.upperBound - range.lowerBound) * fraction
+        let snapped = (raw / step).rounded() * step
+        value = min(max(snapped, range.lowerBound), range.upperBound)
+    }
+
+    private func setValue(_ newValue: Double) {
+        let snapped = (newValue / step).rounded() * step
+        value = min(max(snapped, range.lowerBound), range.upperBound)
+    }
+}
+
+/// Small, consistent icon treatment shared by setting rows and section headers.
+private struct SettingsIconTile: View {
+    let symbol: String
+    let tint: Color
+    var size: CGFloat = 40
+
+    var body: some View {
+        Image(systemName: resolvedSymbol)
+            .font(.system(size: size * 0.42, weight: .semibold))
+            .foregroundStyle(tint)
+            .frame(width: size, height: size)
+            .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: size * 0.28,
+                                                                  style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
+                .stroke(tint.opacity(0.08), lineWidth: 1))
+    }
+
+    /// Keep the settings UI legible on older macOS/SF Symbols combinations.
+    /// The detailed names are only visual sugar; these fallbacks are available
+    /// on every system LaunchPoint supports.
+    private var resolvedSymbol: String {
+        switch symbol {
+        case "waveform.path.ecg": return "waveform"
+        case "scope": return "viewfinder"
+        case "menubar.rectangle": return "rectangle"
+        case "rocket.fill": return "paperplane.fill"
+        case "photo.on.rectangle.angled": return "photo"
+        case "wrench.and.screwdriver.fill": return "wrench"
+        case "app.badge.plus": return "plus"
+        default: return symbol
+        }
+    }
+}
+
+private struct SettingsSurface<Content: View>: View {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .background(
+                LinearGradient(colors: [Color.white.opacity(0.76),
+                                         AppTheme.settingsCard.opacity(0.72)],
+                               startPoint: .topLeading,
+                               endPoint: .bottomTrailing),
+                in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+            )
+            .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(AppTheme.settingsStroke, lineWidth: 1))
+            .shadow(color: AppTheme.settingsShadow, radius: 16, y: 6)
+    }
+}
+
 private final class SettingsDragHandleView: NSView {
     var dragChanged: ((CGSize) -> Void)?
     var dragEnded: ((CGSize) -> Void)?
@@ -160,8 +285,10 @@ enum TrackpadShortcut: String, CaseIterable, Identifiable {
         case .leftEdgeHorizontal, .rightEdgeHorizontal, .bottomEdgeVertical,
                 .topEdgeVertical:
             return "在屏幕边缘双指滑动，不占用系统三指或四指手势"
-        case .fourFingerPinchIn, .fiveFingerPinchIn:
-            return "聚拢显示，扩散隐藏；只观察手势，不拦截系统操作"
+        case .fourFingerPinchIn:
+            return "聚拢显示、扩散隐藏；推荐使用，避开系统五指应用叠层"
+        case .fiveFingerPinchIn:
+            return "聚拢显示、扩散隐藏；macOS 可能同时打开系统应用叠层"
         }
     }
 }
@@ -322,6 +449,8 @@ enum Settings {
 
 /// 独立设置窗口(⌘, 打开;修改即时生效)。
 struct SettingsPanel: View {
+    static let preferredSize = CGSize(width: 560, height: 820)
+
     let close: () -> Void
     let dragChanged: (CGSize) -> Void
     let dragEnded: (CGSize) -> Void
@@ -372,18 +501,132 @@ struct SettingsPanel: View {
     }
 
     var body: some View {
+        settingsShell
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .foregroundStyle(AppTheme.charcoal)
+            .tint(AppTheme.blue)
+            .environment(\.colorScheme, .light)
+            .background {
+                AppTheme.settingsCanvas
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(AppTheme.settingsStroke, lineWidth: 1))
+            .shadow(color: AppTheme.settingsShadow, radius: 24, y: 10)
+            .onDisappear {
+                flushPendingPreview()
+                updateChecker.cancel()
+            }
+            .alert("按名称重新排列?", isPresented: $confirmArrange) {
+                Button("重新排列", role: .destructive) {
+                    LayoutStore.shared.arrangeAllByName()
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("将按显示名重排所有页面上的应用与文件夹，现有自定义顺序会被打乱，文件夹内容不变。")
+            }
+            .alert("布局数据", isPresented: Binding(
+                get: { dataMessage != nil },
+                set: { if !$0 { dataMessage = nil } }
+            )) {
+                Button("好", role: .cancel) { dataMessage = nil }
+            } message: {
+                Text(dataMessage ?? "")
+            }
+            .fileExporter(isPresented: $showExporter,
+                          document: backupDocument,
+                          contentType: .json,
+                          defaultFilename: "LaunchPoint-layout") { result in
+                switch result {
+                case .success:
+                    dataMessage = "布局备份已导出。"
+                case .failure(let error):
+                    dataMessage = "导出失败：\(error.localizedDescription)"
+                }
+            }
+            .fileImporter(isPresented: $showImporter,
+                          allowedContentTypes: [.json]) { result in
+                switch result {
+                case .success(let url):
+                    let accessed = url.startAccessingSecurityScopedResource()
+                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                    do {
+                        try LayoutStore.shared.restoreBackup(Data(contentsOf: url))
+                        dataMessage = "布局已恢复，并已与当前安装的应用对账。"
+                    } catch {
+                        dataMessage = "恢复失败：\(error.localizedDescription)"
+                    }
+                case .failure(let error):
+                    dataMessage = "读取备份失败：\(error.localizedDescription)"
+                }
+            }
+            .fileImporter(isPresented: $showSourceImporter,
+                          allowedContentTypes: [.folder],
+                          allowsMultipleSelection: true) { result in
+                switch result {
+                case .success(let urls):
+                    for url in urls {
+                        LayoutStore.shared.addSource(path: url.path)
+                    }
+                    sources = LayoutStore.shared.sourceRecords()
+                case .failure(let error):
+                    dataMessage = "添加应用来源失败：\(error.localizedDescription)"
+                }
+            }
+            .fileImporter(isPresented: $showProgramImporter,
+                          allowedContentTypes: [.application, .unixExecutable],
+                          allowsMultipleSelection: true) { result in
+                switch result {
+                case .success(let urls):
+                    var added = 0
+                    for url in urls {
+                        let accessed = url.startAccessingSecurityScopedResource()
+                        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                        if LayoutStore.shared.addCustomApp(path: url.path) { added += 1 }
+                    }
+                    customApps = LayoutStore.shared.customAppPaths()
+                    if added == 0 {
+                        dataMessage = "请选择应用包或可执行文件。"
+                    }
+                case .failure(let error):
+                    dataMessage = "添加程序失败：\(error.localizedDescription)"
+                }
+            }
+    }
+
+    private var settingsShell: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                draggableTitleRegion {
-                    HStack(spacing: 10) {
-                    Image(systemName: "gearshape.fill")
-                        .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(sectionTint(section))
-                    Text("LaunchPoint 设置")
-                        .font(.system(size: 14, weight: .semibold))
-                    Spacer()
+            settingsTitleBar
+            settingsTabs
+            Rectangle().fill(AppTheme.separator.opacity(0.55)).frame(height: 1)
+            Group {
+                if section == .apps {
+                    ScrollView(.vertical) {
+                        appSettings.padding(18)
+                    }
+                } else {
+                    ScrollView(.vertical) {
+                        settingsSectionContent
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 12)
                     }
                 }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .clipped()
+        }
+    }
+
+    private var settingsTitleBar: some View {
+        ZStack {
+            draggableTitleRegion { Color.clear }
+            Text("LaunchPoint 设置")
+                .font(.system(size: 20, weight: .semibold, design: .rounded))
+                .tracking(-0.2)
+            HStack {
+                Spacer()
                 Button(action: close) {
                     Image(systemName: "xmark")
                         .font(.system(size: 12, weight: .semibold))
@@ -392,139 +635,49 @@ struct SettingsPanel: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(AppTheme.secondaryText)
-                .background(AppTheme.subtleFill, in: Circle())
+                .background(Color.white.opacity(0.46), in: Circle())
+                .overlay(Circle().stroke(AppTheme.settingsStroke, lineWidth: 1))
                 .help("关闭设置")
             }
-            .padding(.horizontal, 12)
-            .frame(height: 42)
-            .background(titleBarBackground)
+        }
+        .padding(.horizontal, 18)
+        .frame(height: 58)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(titleBarBackground)
+    }
 
-            HStack(spacing: 6) {
-                settingsTab(.general, title: "通用", symbol: "gearshape")
-                settingsTab(.interface, title: "界面", symbol: "rectangle.3.group")
-                settingsTab(.apps, title: "Apps", symbol: "square.stack.3d.up")
-                settingsTab(.advanced, title: "高级", symbol: "slider.horizontal.3")
-                settingsTab(.about, title: "关于", symbol: "info.circle")
-            }
-            .padding(.horizontal, 14)
-            .padding(.bottom, 8)
+    private var settingsTabs: some View {
+        HStack(spacing: 10) {
+            settingsTab(.general, title: "通用", symbol: "gearshape")
+            settingsTab(.interface, title: "界面", symbol: "rectangle.3.group")
+            settingsTab(.apps, title: "Apps", symbol: "square.stack.3d.up")
+            settingsTab(.advanced, title: "高级", symbol: "slider.horizontal.3")
+            settingsTab(.about, title: "关于", symbol: "info.circle")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .fixedSize(horizontal: false, vertical: true)
+    }
 
-            Divider()
-
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 0) {
-                    switch section {
-                    case .general:
-                        generalSettings
-                    case .interface:
-                        interfaceSettings
-                    case .apps:
-                        appSettings
-                    case .advanced:
-                        advancedSettings
-                    case .about:
-                        aboutSettings
-                    }
-                }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .scrollIndicators(.automatic)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
-        }
-        .frame(width: 560, height: 440)
-        .foregroundStyle(AppTheme.charcoal)
-        .tint(AppTheme.blue)
-        .environment(\.colorScheme, .light)
-        .background(AppTheme.panelBackground, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(AppTheme.separator, lineWidth: 1))
-        .shadow(color: AppTheme.charcoal.opacity(0.2), radius: 22, y: 9)
-        .onDisappear {
-            flushPendingPreview()
-            updateChecker.cancel()
-        }
-        .alert("按名称重新排列?", isPresented: $confirmArrange) {
-            Button("重新排列", role: .destructive) {
-                LayoutStore.shared.arrangeAllByName()
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("将按显示名重排所有页面上的应用与文件夹，现有自定义顺序会被打乱，文件夹内容不变。")
-        }
-        .alert("布局数据", isPresented: Binding(
-            get: { dataMessage != nil },
-            set: { if !$0 { dataMessage = nil } }
-        )) {
-            Button("好", role: .cancel) { dataMessage = nil }
-        } message: {
-            Text(dataMessage ?? "")
-        }
-        .fileExporter(isPresented: $showExporter,
-                      document: backupDocument,
-                      contentType: .json,
-                      defaultFilename: "LaunchPoint-layout") { result in
-            switch result {
-            case .success:
-                dataMessage = "布局备份已导出。"
-            case .failure(let error):
-                dataMessage = "导出失败：\(error.localizedDescription)"
-            }
-        }
-        .fileImporter(isPresented: $showImporter,
-                      allowedContentTypes: [.json]) { result in
-            switch result {
-            case .success(let url):
-                let accessed = url.startAccessingSecurityScopedResource()
-                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-                do {
-                    try LayoutStore.shared.restoreBackup(Data(contentsOf: url))
-                    dataMessage = "布局已恢复，并已与当前安装的应用对账。"
-                } catch {
-                    dataMessage = "恢复失败：\(error.localizedDescription)"
-                }
-            case .failure(let error):
-                dataMessage = "读取备份失败：\(error.localizedDescription)"
-            }
-        }
-        .fileImporter(isPresented: $showSourceImporter,
-                      allowedContentTypes: [.folder],
-                      allowsMultipleSelection: true) { result in
-            switch result {
-            case .success(let urls):
-                for url in urls {
-                    LayoutStore.shared.addSource(path: url.path)
-                }
-                sources = LayoutStore.shared.sourceRecords()
-            case .failure(let error):
-                dataMessage = "添加应用来源失败：\(error.localizedDescription)"
-            }
-        }
-        .fileImporter(isPresented: $showProgramImporter,
-                      allowedContentTypes: [.application, .unixExecutable],
-                      allowsMultipleSelection: true) { result in
-            switch result {
-            case .success(let urls):
-                var added = 0
-                for url in urls {
-                    let accessed = url.startAccessingSecurityScopedResource()
-                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-                    if LayoutStore.shared.addCustomApp(path: url.path) { added += 1 }
-                }
-                customApps = LayoutStore.shared.customAppPaths()
-                if added == 0 {
-                    dataMessage = "请选择应用包或可执行文件。"
-                }
-            case .failure(let error):
-                dataMessage = "添加程序失败：\(error.localizedDescription)"
-            }
+    @ViewBuilder
+    private var settingsSectionContent: some View {
+        switch section {
+        case .general:
+            generalSettings
+        case .interface:
+            interfaceSettings
+        case .apps:
+            appSettings
+        case .advanced:
+            advancedSettings
+        case .about:
+            aboutSettings
         }
     }
 
     private var generalSettings: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("启动")
-                .font(.title3.weight(.semibold))
+            settingsSectionLabel("启动", symbol: "rocket.fill", tint: AppTheme.settingsBlue)
 
             settingCard {
                 settingRow("开机启动", detail: "登录 macOS 后自动启动 LaunchPoint") {
@@ -614,13 +767,9 @@ struct SettingsPanel: View {
 
             }
 
-            Text("快捷键修改后会立即生效。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            settingsInfoCard("快捷键修改后会立即生效。", symbol: "sparkles")
             Spacer()
-            Text("布局数据保存在 ~/Library/Application Support/LaunchPoint/")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            settingsInfoCard("布局数据保存在 ~/Library/Application Support/LaunchPoint/", symbol: "externaldrive")
         }
     }
 
@@ -698,13 +847,11 @@ struct SettingsPanel: View {
 
                 settingRow("图标大小", detail: "只调整图标的视觉比例") {
                     VStack(alignment: .trailing, spacing: 3) {
-                        Slider(value: iconScaleBinding,
-                               in: Settings.minimumIconScale...Settings.maximumIconScale,
-                               step: 0.05)
-                            .frame(width: 118)
-                        Text("\(Int((iconScale * 100).rounded()))%")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                        CompactSlider(value: iconScaleBinding,
+                                      range: Settings.minimumIconScale...Settings.maximumIconScale,
+                                      step: 0.05,
+                                      valueText: "\(Int((iconScale * 100).rounded()))%",
+                                      accessibilityTitle: "图标大小")
                     }
                     .accessibilityLabel("图标大小")
                 }
@@ -752,20 +899,118 @@ struct SettingsPanel: View {
     }
 
     private var interfaceSettings: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            layoutSettings
-            Divider()
-            appearanceSettings
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                settingsSectionLabel("显示与网格", symbol: "square.grid.3x3.fill", tint: AppTheme.settingsBlue)
+                settingCard {
+                    settingRow("显示模式", detail: "分页浏览或连续滚动") {
+                        Picker("显示模式", selection: Binding(get: { Settings.viewMode }, set: {
+                            Settings.viewMode = $0
+                            AppState.shared.viewMode = $0
+                        })) { ForEach(LaunchViewMode.allCases) { Text($0.label).tag($0) } }
+                        .labelsHidden().frame(width: 130)
+                    }
+                    Divider()
+                    settingRow("显示屏幕", detail: "选择启动台出现的屏幕") {
+                        Picker("显示屏幕", selection: Binding(get: { Settings.displayStrategy }, set: {
+                            Settings.displayStrategy = $0
+                            (NSApp.delegate as? AppDelegate)?.refreshSelectedScreen()
+                        })) { ForEach(DisplayStrategy.allCases) { Text($0.label).tag($0) } }
+                        .labelsHidden().frame(width: 145)
+                    }
+                    Divider()
+                    settingRow("F4 快捷键", detail: "和自定义快捷键并存") {
+                        Toggle("F4 快捷键", isOn: Binding(get: { Settings.enableF4Shortcut }, set: {
+                            Settings.enableF4Shortcut = $0
+                            (NSApp.delegate as? AppDelegate)?.hotkeyChanged()
+                        })).labelsHidden().toggleStyle(.switch)
+                    }
+                    Divider()
+                    settingRow("热角", detail: "移到屏幕边角显示启动台") {
+                        Picker("热角", selection: $hotCorner) {
+                            ForEach(HotCorner.allCases) { Text($0.label).tag($0) }
+                        }.labelsHidden().frame(width: 130)
+                            .onChange(of: hotCorner) { _, value in Settings.hotCorner = value }
+                    }
+                    Divider()
+                    settingRow("每页列数", detail: "5 至 10 列") {
+                        Stepper(value: gridColumnsBinding, in: 5...10) {
+                            Text("\(columns) 列").monospacedDigit().frame(width: 48)
+                        }
+                    }
+                    Divider()
+                    settingRow("每页行数", detail: "3 至 8 行") {
+                        Stepper(value: gridRowsBinding, in: 3...8) {
+                            Text("\(rows) 行").monospacedDigit().frame(width: 48)
+                        }
+                    }
+                }
+                settingsInfoCard("网格容量变化后，超出项目会自动移到下一页。", symbol: "square.grid.3x3")
+            }
+            VStack(alignment: .leading, spacing: 12) {
+                settingsSectionLabel("图标与背景", symbol: "photo.on.rectangle.angled", tint: AppTheme.settingsLavender)
+                settingCard {
+                    settingRow("图标大小", detail: "调整图标视觉比例") {
+                        VStack(alignment: .trailing, spacing: 3) {
+                            CompactSlider(value: iconScaleBinding,
+                                          range: Settings.minimumIconScale...Settings.maximumIconScale,
+                                          step: 0.05,
+                                          valueText: "\(Int((iconScale * 100).rounded()))%",
+                                          accessibilityTitle: "图标大小")
+                        }
+                        .accessibilityLabel("图标大小")
+                    }
+                    Divider()
+                    settingRow("横向间距", detail: "同一行图标间距") {
+                        spacingSlider(value: horizontalSpacingBinding,
+                                      displayValue: Int(horizontalSpacing.rounded()))
+                    }
+                    Divider()
+                    settingRow("纵向间距", detail: "相邻行图标间距") {
+                        spacingSlider(value: verticalSpacingBinding,
+                                      displayValue: Int(verticalSpacing.rounded()))
+                    }
+                    Divider()
+                    settingRow("背景类型", detail: "启动台打开时的背景效果") {
+                        Picker("背景类型", selection: $backgroundStyle) {
+                            ForEach(BackgroundStyle.allCases) { Text($0.label).tag($0) }
+                        }.labelsHidden().pickerStyle(.segmented).frame(width: 130)
+                            .onChange(of: backgroundStyle) { _, value in
+                                AppState.shared.setBackgroundStyle(value)
+                            }
+                    }
+                    if backgroundStyle == .wallpaper {
+                        Divider()
+                        settingRow("模糊壁纸", detail: "增强图标与文字辨识度") {
+                            Toggle("模糊壁纸", isOn: $blurWallpaper)
+                                .labelsHidden().toggleStyle(.switch)
+                                .onChange(of: blurWallpaper) { _, value in
+                                    AppState.shared.setBlurWallpaper(value)
+                                }
+                        }
+                    }
+                }
+
+                settingsSectionLabel("整理", symbol: "arrow.up.arrow.down", tint: AppTheme.settingsPink)
+                    .padding(.top, 2)
+                settingCard {
+                    settingRow("按名称重新排列", detail: "重新整理所有页面") {
+                        Button("重新排列…") { confirmArrange = true }
+                    }
+                    Divider()
+                    settingRow("整理空位", detail: "保留顺序并移除空洞") {
+                        Button("整理") { LayoutStore.shared.fillEmptySlots() }
+                    }
+                }
+            }
         }
     }
 
     private var advancedSettings: some View {
-        VStack(alignment: .leading, spacing: 22) {
+        VStack(alignment: .leading, spacing: 16) {
             dataSettings
-            Divider()
             VStack(alignment: .leading, spacing: 8) {
-                Text("维护")
-                    .font(.title3.weight(.semibold))
+                settingsSectionLabel("维护", symbol: "wrench.and.screwdriver.fill", tint: AppTheme.settingsMint)
                 settingCard {
                     settingRow("重新扫描应用", detail: "发现新安装的应用并清理已移除项目") {
                         Button("立即扫描") {
@@ -774,28 +1019,50 @@ struct SettingsPanel: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
     }
 
     private var aboutSettings: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 14) {
+            HStack(spacing: 20) {
                 if let icon = NSImage(named: "AppIcon") {
                     Image(nsImage: icon)
                         .resizable()
-                        .frame(width: 48, height: 48)
+                        .interpolation(.high)
+                        .frame(width: 104, height: 104)
+                        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                        .shadow(color: AppTheme.settingsShadow, radius: 10, y: 5)
                 } else {
-                    Image(systemName: "square.grid.3x3.fill")
-                        .font(.system(size: 38, weight: .medium))
-                        .foregroundStyle(Color.accentColor)
+                    SettingsIconTile(symbol: "square.grid.3x3.fill", tint: AppTheme.settingsBlue, size: 104)
                 }
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 8) {
                     Text("LaunchPoint")
-                        .font(.title2.weight(.semibold))
+                        .font(.system(size: 30, weight: .bold, design: .rounded))
                     Text("简洁、快速的 macOS 应用启动器")
-                        .foregroundStyle(.secondary)
+                        .font(.body)
+                        .foregroundStyle(AppTheme.secondaryText)
+                    Text(displayCurrentVersion)
+                        .font(.caption.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(AppTheme.settingsBlue)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(AppTheme.settingsBlue.opacity(0.12), in: Capsule())
                 }
+                Spacer(minLength: 0)
             }
+            .padding(22)
+            .background(
+                LinearGradient(colors: [Color.white.opacity(0.78),
+                                         AppTheme.settingsLavender.opacity(0.06),
+                                         AppTheme.settingsMint.opacity(0.07)],
+                               startPoint: .topLeading,
+                               endPoint: .bottomTrailing),
+                in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+            )
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(AppTheme.settingsStroke, lineWidth: 1))
+            .shadow(color: AppTheme.settingsShadow, radius: 16, y: 6)
             settingCard {
                 settingRow("版本", detail: "当前构建版本") {
                     Text(displayCurrentVersion)
@@ -840,9 +1107,7 @@ struct SettingsPanel: View {
                     }
                 }
             }
-            Text("LaunchPoint 由 AI 完整生成和实现，未来版本通过 GitHub Releases 发布。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            settingsInfoCard("LaunchPoint 由 AI 完整生成和实现，未来版本通过 GitHub Releases 发布。", symbol: "sparkles")
             Spacer()
         }
     }
@@ -966,17 +1231,14 @@ struct SettingsPanel: View {
                 }
             }
 
-            Text("系统壁纸会随 macOS 当前桌面背景更新。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            settingsInfoCard("系统壁纸会随 macOS 当前桌面背景更新。", symbol: "macwindow")
             Spacer()
         }
     }
 
     private var dataSettings: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("布局数据")
-                .font(.title3.weight(.semibold))
+            settingsSectionLabel("布局数据", symbol: "square.and.arrow.up", tint: AppTheme.settingsLavender)
 
             settingCard {
                 settingRow("导出布局", detail: "备份应用顺序、文件夹、别名和隐藏状态") {
@@ -999,18 +1261,16 @@ struct SettingsPanel: View {
                 }
             }
 
-            Text("备份文件使用 JSON 格式，可用于迁移或在调整布局前留存副本。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            settingsInfoCard("备份文件使用 JSON 格式，可用于迁移或在调整布局前留存副本。", symbol: "doc.text")
             Spacer()
         }
     }
 
     private var appSettings: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("应用来源")
-                    .font(.title3.weight(.semibold))
+                settingsSectionLabel("应用来源", symbol: "folder.fill", tint: AppTheme.settingsTeal)
                 Spacer()
                 Button {
                     showSourceImporter = true
@@ -1021,6 +1281,8 @@ struct SettingsPanel: View {
             }
 
             settingCard {
+                ScrollView(.vertical) {
+                    VStack(spacing: 12) {
                 if sources.isEmpty {
                     Text("还没有添加应用来源。")
                         .font(.callout)
@@ -1030,8 +1292,7 @@ struct SettingsPanel: View {
 
                 ForEach(sources, id: \.path) { source in
                     HStack(spacing: 10) {
-                        Image(systemName: "folder")
-                            .foregroundStyle(.secondary)
+                        SettingsIconTile(symbol: "folder.fill", tint: AppTheme.settingsTeal, size: 36)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(URL(fileURLWithPath: source.path).lastPathComponent)
                                 .font(.body.weight(.medium))
@@ -1065,17 +1326,17 @@ struct SettingsPanel: View {
                         Divider()
                     }
                 }
+                    }
+                }
+                .scrollIndicators(.automatic)
             }
+            .frame(maxHeight: .infinity, alignment: .top)
 
-            Text("停用来源不会删除已有布局，只会停止扫描该目录中的应用。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Divider().padding(.vertical, 2)
-
+            settingsInfoCard("停用来源不会删除已有布局，只会停止扫描该目录中的应用。", symbol: "pause.circle")
+            }
+            VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("手动添加程序")
-                    .font(.title3.weight(.semibold))
+                settingsSectionLabel("手动添加程序", symbol: "app.badge.plus", tint: AppTheme.settingsLavender)
                 Spacer()
                 Button {
                     showProgramImporter = true
@@ -1086,6 +1347,8 @@ struct SettingsPanel: View {
             }
 
             settingCard {
+                ScrollView(.vertical) {
+                    VStack(spacing: 12) {
                 if customApps.isEmpty {
                     Text("可添加任意应用包或可执行文件。")
                         .font(.callout)
@@ -1095,8 +1358,7 @@ struct SettingsPanel: View {
 
                 ForEach(customApps, id: \.self) { path in
                     HStack(spacing: 10) {
-                        Image(systemName: "terminal")
-                            .foregroundStyle(.secondary)
+                        SettingsIconTile(symbol: "app.badge", tint: AppTheme.settingsLavender, size: 36)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent)
                                 .font(.body.weight(.medium))
@@ -1121,8 +1383,13 @@ struct SettingsPanel: View {
                         Divider()
                     }
                 }
+                    }
+                }
+                .scrollIndicators(.automatic)
             }
-            Spacer()
+            .frame(maxHeight: .infinity, alignment: .top)
+            settingsInfoCard("这里也可以添加不在应用来源目录中的可执行程序。", symbol: "plus.circle")
+            }
         }
     }
 
@@ -1132,14 +1399,18 @@ struct SettingsPanel: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: symbol)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 14, weight: .semibold))
                 Text(title)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 13, weight: .semibold))
             }
-            .frame(maxWidth: .infinity, minHeight: 34)
+            .frame(maxWidth: .infinity, minHeight: 42)
             .foregroundStyle(section == target ? sectionTint(target) : AppTheme.secondaryText)
-            .background(section == target ? sectionTint(target).opacity(0.16) : .clear,
-                        in: RoundedRectangle(cornerRadius: 8))
+            .background(section == target ? Color.white.opacity(0.76) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .stroke(section == target ? AppTheme.settingsStroke : Color.clear, lineWidth: 1))
+            .shadow(color: section == target ? sectionTint(target).opacity(0.16) : .clear,
+                    radius: 9, y: 4)
         }
         .buttonStyle(.plain)
     }
@@ -1163,7 +1434,33 @@ struct SettingsPanel: View {
 
     private func sectionTint(_ target: Section) -> Color {
         _ = target
-        return AppTheme.blue
+        return AppTheme.settingsBlue
+    }
+
+    private func settingsSectionLabel(_ title: String,
+                                      symbol: String,
+                                      tint: Color) -> some View {
+        HStack(spacing: 10) {
+            SettingsIconTile(symbol: symbol, tint: tint, size: 34)
+            Text(title)
+                .font(.title3.weight(.semibold))
+        }
+    }
+
+    private func settingsInfoCard(_ text: String,
+                                  symbol: String = "info.circle") -> some View {
+        HStack(spacing: 10) {
+            SettingsIconTile(symbol: symbol, tint: AppTheme.settingsBlue, size: 30)
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(AppTheme.secondaryText)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.46), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .stroke(AppTheme.settingsStroke, lineWidth: 1))
     }
 
     private var gridColumnsBinding: Binding<Int> {
@@ -1219,15 +1516,11 @@ struct SettingsPanel: View {
     }
 
     private func spacingSlider(value: Binding<Double>, displayValue: Int) -> some View {
-        VStack(alignment: .trailing, spacing: 3) {
-            Slider(value: value,
-                   in: Settings.minimumSpacing...Settings.maximumSpacing,
-                   step: 1)
-                .frame(width: 118)
-            Text("\(displayValue) pt")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-        }
+        CompactSlider(value: value,
+                      range: Settings.minimumSpacing...Settings.maximumSpacing,
+                      step: 1,
+                      valueText: "\(displayValue) pt",
+                      accessibilityTitle: "间距")
     }
 
     private func updateSpacing(horizontal: Double, vertical: Double) {
@@ -1333,25 +1626,97 @@ struct SettingsPanel: View {
     }
 
     private func settingCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        VStack(spacing: 12, content: content)
-            .padding(12)
-            .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8)
-                .stroke(AppTheme.separator, lineWidth: 1))
+        SettingsSurface {
+            VStack(spacing: 6, content: content)
+                .padding(12)
+        }
     }
 
     private func settingRow<Control: View>(_ title: String, detail: String,
                                            @ViewBuilder control: () -> Control) -> some View {
-        HStack(spacing: 16) {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                settingDescription(title, detail: detail)
+                    .frame(minWidth: 130)
+                Spacer(minLength: 4)
+                control().fixedSize()
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                settingDescription(title, detail: detail)
+                HStack { Spacer(minLength: 0); control() }
+            }
+        }
+        .frame(minHeight: 42)
+    }
+
+    private func settingDescription(_ title: String, detail: String) -> some View {
+        HStack(spacing: 10) {
+            SettingsIconTile(symbol: settingsSymbol(for: title),
+                             tint: settingsTint(for: title),
+                             size: 34)
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(.body.weight(.medium))
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            Spacer(minLength: 12)
-            control()
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
+        }
+    }
+
+    private func settingsSymbol(for title: String) -> String {
+        switch title {
+        case "开机启动": return "power"
+        case "唤起快捷键": return "keyboard"
+        case "触控板唤起": return "hand.tap"
+        case "多指监听": return "waveform.path.ecg"
+        case "触点诊断": return "scope"
+        case "显示菜单栏图标": return "menubar.rectangle"
+        case "显示模式": return "rectangle.3.group"
+        case "显示屏幕": return "display"
+        case "F4 快捷键": return "keyboard"
+        case "热角": return "arrow.down.right"
+        case "每页列数": return "square.grid.3x3"
+        case "每页行数": return "rectangle.grid.3x3"
+        case "图标大小": return "photo"
+        case "横向间距": return "arrow.left.and.right"
+        case "纵向间距": return "arrow.up.and.down"
+        case "背景类型", "类型": return "paintpalette"
+        case "模糊壁纸": return "drop"
+        case "按名称重新排列": return "textformat"
+        case "整理空位": return "checkmark.circle"
+        case "导出布局": return "square.and.arrow.up"
+        case "恢复布局": return "square.and.arrow.down"
+        case "重新扫描应用": return "arrow.triangle.2.circlepath"
+        case "版本": return "info.circle"
+        case "检查更新": return "arrow.down.circle"
+        case "发现新版本": return "sparkles"
+        case "发行版页面": return "safari"
+        case "开源地址": return "chevron.left.forwardslash.chevron.right"
+        default: return "circle.grid.2x2"
+        }
+    }
+
+    private func settingsTint(for title: String) -> Color {
+        switch title {
+        case "开机启动", "显示屏幕", "每页行数", "图标大小", "检查更新":
+            return AppTheme.settingsBlue
+        case "唤起快捷键", "显示模式", "导出布局", "恢复布局", "发行版页面", "发现新版本":
+            return AppTheme.settingsLavender
+        case "触控板唤起", "多指监听", "横向间距", "纵向间距", "重新扫描应用":
+            return AppTheme.settingsTeal
+        case "触点诊断", "整理空位", "版本":
+            return AppTheme.settingsMint
+        case "F4 快捷键", "模糊壁纸", "开源地址":
+            return AppTheme.settingsOrange
+        case "热角", "每页列数", "背景类型", "类型", "按名称重新排列":
+            return AppTheme.settingsPink
+        default:
+            return AppTheme.settingsBlue
         }
     }
 }
