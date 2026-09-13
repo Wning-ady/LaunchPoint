@@ -12,6 +12,13 @@ struct UninstallIntegrationFixture {
         let bundleID = "com.waning.LaunchPointUninstallFixture.\(suffix)"
         let appURL = fm.temporaryDirectory
             .appendingPathComponent("LaunchPointUninstallFixture-\(suffix).app", isDirectory: true)
+        // AppActions intentionally moves the fixture bundle to the user's
+        // Trash. Remove that disposable test artifact when the fixture exits,
+        // so repeated regression runs do not pollute Finder's Trash.
+        let trashedFixture = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".Trash", isDirectory: true)
+            .appendingPathComponent(appURL.lastPathComponent, isDirectory: true)
+        defer { try? fm.removeItem(at: trashedFixture) }
         let contents = appURL.appendingPathComponent("Contents", isDirectory: true)
         let executableDirectory = contents.appendingPathComponent("MacOS", isDirectory: true)
         try fm.createDirectory(at: executableDirectory, withIntermediateDirectories: true)
