@@ -78,7 +78,32 @@ struct UninstallIntegrationFixture {
         guard leftovers.isEmpty else {
             throw FixtureError("Leftovers remain: \(leftovers.map(\.path).joined(separator: ", "))")
         }
-        print("PASS bundle=\(bundleID) delayed-recreation-cleaned=true")
+
+        // A stale LaunchPoint entry may point at an app that was already moved
+        // to Trash. Cleanup should remove its known residuals directly and must
+        // not open Finder (or trigger another authorization prompt) just because
+        // the app bundle itself is missing.
+        try fm.createDirectory(at: applicationSupport, withIntermediateDirectories: true)
+        try Data("stale".utf8).write(to: applicationSupport.appendingPathComponent("stale"))
+        var staleCompletion: String??
+        var finderFallbackCalled = false
+        AppActions.uninstall(
+            appURL: appURL,
+            bundleID: bundleID,
+            beforeFinderFallback: { finderFallbackCalled = true },
+            completion: { staleCompletion = $0 }
+        )
+        while staleCompletion == nil {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        if let error = staleCompletion! {
+            throw FixtureError("Stale cleanup reported an error: \(error)")
+        }
+        guard !finderFallbackCalled,
+              !fm.fileExists(atPath: applicationSupport.path) else {
+            throw FixtureError("Stale cleanup used Finder or left residual data")
+        }
+        print("PASS bundle=\(bundleID) delayed-recreation-cleaned=true stale-entry-no-finder=true")
     }
 
     private struct FixtureError: LocalizedError {

@@ -18,9 +18,14 @@ struct AppItem: Identifiable {
 
 /// Scans application directories for installed apps.
 enum AppScanner {
+    private static let cryptexSystemApplications = "/System/Cryptexes/App/System/Applications"
     private static let iconCache: NSCache<NSString, NSImage> = {
         let cache = NSCache<NSString, NSImage>()
         cache.countLimit = 512
+        // A 160×160 RGBA icon is roughly 100 KiB. Keep the cache bounded by
+        // memory as well as count so large app collections do not make the
+        // first refresh permanently expensive.
+        cache.totalCostLimit = 80 * 1024 * 1024
         return cache
     }()
     private static let maximumSearchDepth = 5
@@ -36,6 +41,11 @@ enum AppScanner {
         "/Applications/Utilities",
         "/System/Applications",
         "/System/Applications/Utilities",
+        // On recent macOS releases some first-party apps (notably Safari)
+        // are exposed from /Applications as symlinks into the sealed Cryptex
+        // volume. FileManager's directory enumerator does not follow those
+        // package symlinks, so include the real application root as well.
+        "/System/Cryptexes/App/System/Applications",
         (("~/Applications") as NSString).expandingTildeInPath,
     ]
 
@@ -58,10 +68,19 @@ enum AppScanner {
             if let cached = iconCache.object(forKey: descriptor.cacheKey) {
                 icon = cached
             } else {
-                let loaded = descriptor.resourceURL.flatMap(NSImage.init(contentsOf:))
+                // Some modern system apps declare AppIcon.icns while keeping
+                // the actual artwork in Assets.car. Books is one example:
+                // its declared ICNS contains only transparent placeholders.
+                // Treat an empty resource as a cache miss and ask Launch
+                // Services for the rendered icon instead of displaying a
+                // blank tile.
+                let declared = descriptor.resourceURL.flatMap(NSImage.init(contentsOf:))
+                let loaded = declared.flatMap { hasVisiblePixels($0) ? $0 : nil }
                     ?? workspace.icon(forFile: fullPath)
                 icon = normalizedIcon(loaded)
-                iconCache.setObject(icon, forKey: descriptor.cacheKey)
+                iconCache.setObject(icon,
+                                    forKey: descriptor.cacheKey,
+                                    cost: Int(iconDisplaySize.width * iconDisplaySize.height * 4))
             }
             items.append(
                 AppItem(id: fullPath,
@@ -73,7 +92,21 @@ enum AppScanner {
             )
         }
 
-        for dir in compactSearchRoots(sources) {
+        var effectiveSources = sources
+        // Existing layout files may predate the Cryptex root. Keep those users'
+        // source settings intact while still discovering sealed first-party
+        // apps whenever the normal /System/Applications source is enabled.
+        if sources.contains(where: {
+            URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath,
+                isDirectory: true).standardizedFileURL.path == "/System/Applications"
+        }), !sources.contains(where: {
+            URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath,
+                isDirectory: true).standardizedFileURL.path == cryptexSystemApplications
+        }) {
+            effectiveSources.append(cryptexSystemApplications)
+        }
+
+        for dir in compactSearchRoots(effectiveSources) {
             let rootURL = URL(fileURLWithPath: dir, isDirectory: true)
             guard let enumerator = fm.enumerator(
                 at: rootURL,
@@ -110,6 +143,38 @@ enum AppScanner {
         return items.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
+    }
+
+    /// Detect resources that load successfully but contain no visible pixels.
+    /// This is common when an app's Info.plist points at a placeholder ICNS
+    /// and its real icon lives in an asset catalog. Rendering a small sample
+    /// keeps this check cheap while still handling premultiplied alpha.
+    private static func hasVisiblePixels(_ image: NSImage) -> Bool {
+        let side = 64
+        var proposedRect = NSRect(x: 0, y: 0, width: side, height: side)
+        guard let sourceImage = image.cgImage(
+            forProposedRect: &proposedRect,
+            context: nil,
+            hints: [.interpolation: NSImageInterpolation.high.rawValue]
+        ), let context = CGContext(
+            data: nil,
+            width: side,
+            height: side,
+            bitsPerComponent: 8,
+            bytesPerRow: side * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                | CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return false }
+
+        context.draw(sourceImage, in: CGRect(x: 0, y: 0, width: side, height: side))
+        guard let bytes = context.data?.assumingMemoryBound(to: UInt8.self) else {
+            return false
+        }
+        for index in 0..<(side * side) where bytes[index * 4 + 3] >= 8 {
+            return true
+        }
+        return false
     }
 
     /// Build a cache key from the files that can change during an in-place update.
@@ -200,6 +265,9 @@ enum AppScanner {
             return NSImage(cgImage: sourceImage, size: iconDisplaySize)
         }
 
+        let contentRect = CGRect(x: minX, y: minY,
+                                 width: maxX - minX + 1,
+                                 height: maxY - minY + 1)
         let margin = 2
         minX = max(0, minX - margin)
         minY = max(0, minY - margin)
@@ -208,6 +276,17 @@ enum AppScanner {
         let cropRect = CGRect(x: minX, y: minY,
                               width: maxX - minX + 1,
                               height: maxY - minY + 1)
+        // Preserve icons that already carry transparent rounded corners. A
+        // mask is only needed for opaque full-bleed artwork such as legacy
+        // iOS-style square icons. Sample the visible content bounds rather
+        // than the source canvas so transparent outer margins do not hide a
+        // square icon's actual corners.
+        let shouldRoundOpaqueCanvas = opaqueCornerSamples(
+            bytes: bytes,
+            side: sampleSide,
+            rect: contentRect,
+            threshold: 245
+        )
         guard let cropped = raster.cropping(to: cropRect),
               let outputContext = CGContext(
                 data: nil,
@@ -228,12 +307,54 @@ enum AppScanner {
                               y: (CGFloat(sampleSide) - drawSize.height) / 2,
                               width: drawSize.width,
                               height: drawSize.height)
+        if shouldRoundOpaqueCanvas {
+            let radius = min(drawSize.width, drawSize.height) * 0.18
+            outputContext.saveGState()
+            outputContext.addPath(CGPath(
+                roundedRect: drawRect,
+                cornerWidth: radius,
+                cornerHeight: radius,
+                transform: nil
+            ))
+            outputContext.clip()
+        }
+
         outputContext.interpolationQuality = .high
         outputContext.draw(cropped, in: drawRect)
+        if shouldRoundOpaqueCanvas { outputContext.restoreGState() }
         guard let normalized = outputContext.makeImage() else {
             return NSImage(cgImage: sourceImage, size: iconDisplaySize)
         }
         return NSImage(cgImage: normalized, size: iconDisplaySize)
+    }
+
+    /// Returns true only when every corner patch is effectively opaque. This
+    /// distinguishes a full-bleed square icon from an icon that already has
+    /// transparent rounded corners or a free-form silhouette.
+    private static func opaqueCornerSamples(bytes: UnsafePointer<UInt8>,
+                                            side: Int,
+                                            rect: CGRect,
+                                            threshold: UInt8) -> Bool {
+        let minX = max(0, min(side - 1, Int(rect.minX.rounded(.down))))
+        let minY = max(0, min(side - 1, Int(rect.minY.rounded(.down))))
+        let width = max(1, min(side - minX, Int(rect.width.rounded(.up))))
+        let height = max(1, min(side - minY, Int(rect.height.rounded(.up))))
+        let patch = min(min(width, height), max(8, min(width, height) / 16))
+        let maxX = minX + width - patch
+        let maxY = minY + height - patch
+        let origins = [(minX, minY), (maxX, minY),
+                       (minX, maxY), (maxX, maxY)]
+        for (originX, originY) in origins {
+            var opaque = 0
+            let total = patch * patch
+            for y in originY..<(originY + patch) {
+                for x in originX..<(originX + patch) {
+                    if bytes[(y * side + x) * 4 + 3] >= threshold { opaque += 1 }
+                }
+            }
+            if opaque * 100 < total * 92 { return false }
+        }
+        return true
     }
 
     /// Prefer the app's declared icon resource. If a package declares a missing

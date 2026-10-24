@@ -115,6 +115,7 @@ enum PageEntry: Identifiable {
 /// 保证:已有条目保持自定义顺序,新装的追加到末尾,卸载的自动移除。
 final class LayoutStore: ObservableObject {
     static let shared = LayoutStore()
+    private static let favoritesDefaultsKey = "FavoriteAppPaths"
 
     /// 网格容量(设置面板可调;启动时由 Settings 注入,避免此处依赖设置层)。
     static var columns = 7
@@ -127,6 +128,8 @@ final class LayoutStore: ObservableObject {
     @Published private(set) var pages: [[PageEntry]] = []
     /// 应用目录正在后台扫描。旧页面会继续显示，只用轻量状态给用户反馈。
     @Published private(set) var isRefreshing = false
+    /// 收藏顺序单独持久化，避免改变用户已经排好的网格布局。
+    @Published private(set) var favoriteIDs: [String]
 
     private var layout: Layout
 
@@ -154,12 +157,43 @@ final class LayoutStore: ObservableObject {
     }()
 
     private init() {
+        favoriteIDs = UserDefaults.standard.stringArray(forKey: Self.favoritesDefaultsKey) ?? []
         if let data = try? Data(contentsOf: Self.fileURL),
            let decoded = try? JSONDecoder().decode(Layout.self, from: data) {
             layout = decoded
         } else {
             layout = .initial()
         }
+    }
+
+    /// 是否已收藏应用。收藏不改变页面顺序，只影响搜索优先级和收藏视图。
+    func isFavorite(_ appID: String) -> Bool {
+        favoriteIDs.contains(appID)
+    }
+
+    /// 切换收藏状态。新收藏插入最前，保证“置顶”顺序稳定且可预测。
+    func toggleFavorite(_ appID: String) {
+        if let index = favoriteIDs.firstIndex(of: appID) {
+            favoriteIDs.remove(at: index)
+        } else {
+            favoriteIDs.insert(appID, at: 0)
+        }
+        saveFavorites()
+    }
+
+    /// 收藏顺序映射，供搜索排序使用。
+    var favoriteRanks: [String: Int] {
+        Dictionary(uniqueKeysWithValues: favoriteIDs.enumerated().map { ($1, $0) })
+    }
+
+    /// 当前已扫描且可见的收藏应用，按收藏顺序返回。
+    func favoriteItems() -> [AppItem] {
+        let byID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+        return favoriteIDs.compactMap { byID[$0] }
+    }
+
+    private func saveFavorites() {
+        UserDefaults.standard.set(favoriteIDs, forKey: Self.favoritesDefaultsKey)
     }
 
     /// 扫描磁盘并与已存布局对账,然后刷新展示列表并落盘。

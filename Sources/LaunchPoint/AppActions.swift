@@ -487,18 +487,18 @@ enum AppActions {
             }
 
             let initialResiduals = residualPaths(metadata: metadata)
-            let appPath = appURL.standardizedFileURL.path
-            let isSystemManagedApp = appPath.hasPrefix("/Applications/")
-                || appPath.hasPrefix("/System/Applications/")
-                || appPath.hasPrefix("/Library/")
-                || appPath.hasPrefix("/System/")
-            if isSystemManagedApp {
+            if shouldUseFinderFirst(for: appURL.path) {
                 // Include the initial residual snapshot in the same Finder
                 // operation so a protected app and its container share one
                 // authorization prompt.
                 _ = finderTrashOnce([appURL] + initialResiduals)
-            } else if !directTrash(appURL) {
-                _ = finderTrashOnce([appURL] + initialResiduals)
+            } else if FileManager.default.fileExists(atPath: appURL.path) {
+                // User-installed apps normally succeed here without Finder or
+                // an administrator prompt. Fall back only for this actual
+                // failure, rather than based on the parent directory alone.
+                if !directTrash(appURL) {
+                    _ = finderTrashOnce([appURL] + initialResiduals)
+                }
             }
 
             let appWasRemoved = !FileManager.default.fileExists(atPath: appURL.path)
@@ -586,6 +586,27 @@ enum AppActions {
             }
             DispatchQueue.main.async { completion(errorMessage) }
         }
+    }
+
+    /// Only protected system locations need Finder first. Apps installed in
+    /// `/Applications` are normally removable through FileManager without an
+    /// administrator prompt; using Finder for every one of them caused an
+    /// unnecessary password dialog on ordinary user-installed apps.
+    static func shouldUseFinderFirst(for path: String) -> Bool {
+        let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
+        return normalized.hasPrefix("/System/Applications/")
+            || normalized.hasPrefix("/System/")
+            || normalized.hasPrefix("/Library/")
+    }
+
+    /// Only application bundles are eligible for destructive uninstall. A
+    /// custom standalone executable should be removed from LaunchPoint's list,
+    /// not moved to the Trash by a similarly named context-menu action.
+    static func isUninstallableApp(at url: URL) -> Bool {
+        guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame else {
+            return false
+        }
+        return !url.standardizedFileURL.path.hasPrefix("/System/")
     }
 
     /// 先请求正常退出，给应用保存状态的机会；超时后强制退出。
