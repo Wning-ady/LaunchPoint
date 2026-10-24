@@ -23,6 +23,8 @@ enum TrackpadMonitorStatus: Equatable {
 final class AppState: ObservableObject {
     static let shared = AppState()
     @Published var query = ""
+    /// 收藏筛选视图是否打开。收藏顺序与网格布局相互独立。
+    @Published var showFavoritesOnly = false
     /// 去除首尾空白后的有效查询:误触空格不应切换搜索态或参与匹配。
     var effectiveQuery: String { query.trimmingCharacters(in: .whitespaces) }
     /// 当前页码。隐藏后不重置——还原"上次打开的位置"(原生默认行为)。
@@ -331,6 +333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let targetFrame = selectedScreen().frame
         if window.frame != targetFrame { window.setFrame(targetFrame, display: false) }
         AppState.shared.query = ""
+        AppState.shared.showFavoritesOnly = false
         AppState.shared.highlightedAppID = nil
         AppState.shared.openFolderID = nil
         AppState.shared.setOverlayVisible(true)
@@ -664,6 +667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     return nil
                 }
                 if let app = LayoutStore.shared.items.first(where: { $0.id == id }) {
+                    AppUsageStore.shared.record(appID: app.id)
                     AppActions.launch(app.url)
                     self?.dismissOverlay()
                     return nil

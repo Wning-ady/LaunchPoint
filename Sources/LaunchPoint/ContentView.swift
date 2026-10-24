@@ -247,6 +247,9 @@ struct ContentView: View {
     // MARK: 简介与卸载状态
     @State private var infoTarget: AppItem?
     @State private var uninstallTarget: AppItem?
+    @State private var uninstallRetryTarget: AppItem?
+    @State private var uninstallResidualCount: Int?
+    @State private var uninstallingAppName: String?
     @State private var uninstallError: String?
 
     private var isFolderRenamePresented: Binding<Bool> {
@@ -425,7 +428,12 @@ struct ContentView: View {
 
     /// 搜索结果:前缀/词首/首字母/缩写/拼音多路匹配,按匹配度排序。
     private var filtered: [AppItem] {
-        SearchEngine.rank(state.effectiveQuery, in: store.items)
+        SearchEngine.rank(
+            state.effectiveQuery,
+            in: store.items,
+            favoriteRanks: store.favoriteRanks,
+            usageScores: AppUsageStore.shared.scores(for: store.items.map(\.id))
+        )
     }
 
     var body: some View {
@@ -437,7 +445,7 @@ struct ContentView: View {
             mainContent
                 .allowsHitTesting(!state.showSettings)
 
-            if store.isRefreshing || launchingAppName != nil {
+            if store.isRefreshing || launchingAppName != nil || uninstallingAppName != nil {
                 activityPill
                     .allowsHitTesting(false)
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
@@ -523,7 +531,9 @@ struct ContentView: View {
                     searchField
 
                     if state.effectiveQuery.isEmpty {
-                        if state.viewMode == .scrolling {
+                        if state.showFavoritesOnly {
+                            favoritesGrid
+                        } else if state.viewMode == .scrolling {
                             scrollingGrid
                         } else {
                             pagedGrid
@@ -629,37 +639,29 @@ struct ContentView: View {
         .alert("卸载“\(uninstallTarget?.displayName ?? "")”?", isPresented: isUninstallPresented) {
             Button("移到废纸篓", role: .destructive) {
                 if let app = uninstallTarget {
-                    AppActions.uninstall(
-                        appURL: app.url,
-                        bundleID: app.bundleID,
-                        beforeFinderFallback: {
-                            dismiss()   // Finder 的管理员认证弹窗不能被全屏层挡住
-                        },
-                        completion: { error in
-                            // 即使只有个别残留清理失败，应用本体也可能已经移除。
-                            store.refreshAsync()
-                            if let error {
-                                uninstallError = error
-                                // 覆盖层可能已收起,重新唤起以展示错误
-                                (NSApp.delegate as? AppDelegate)?.showOverlay()
-                            }
-                        }
-                    )
+                    performUninstall(app)
                 }
                 uninstallTarget = nil
             }
             Button("取消", role: .cancel) { uninstallTarget = nil }
         } message: {
-            let residuals = AppActions.residualPaths(
-                appURL: uninstallTarget?.url,
-                bundleID: uninstallTarget?.bundleID
-            ).count
-            Text(residuals > 0
-                 ? "应用本体与 \(residuals) 项残留数据(缓存、偏好设置等)将一并移到废纸篓,可随时恢复。"
-                 : "应用将被移到废纸篓,可随时恢复。")
+            if let residuals = uninstallResidualCount {
+                Text(residuals > 0
+                     ? "应用本体与 \(residuals) 项残留数据(缓存、偏好设置等)将一并移到废纸篓,可随时恢复。"
+                     : "应用将被移到废纸篓,可随时恢复。")
+            } else {
+                Text("正在检查可清理的关联数据…应用本体与可识别的残留会移到废纸篓,可随时恢复。")
+            }
         }
         // 卸载失败提示
         .alert("卸载未完全完成", isPresented: isUninstallErrorPresented) {
+            if uninstallRetryTarget != nil {
+                Button("重试清理残留") {
+                    if let app = uninstallRetryTarget {
+                        performUninstall(app)
+                    }
+                }
+            }
             Button("好", role: .cancel) { uninstallError = nil }
         } message: {
             Text(uninstallError ?? "")
@@ -677,7 +679,9 @@ struct ContentView: View {
                 ProgressView()
                     .controlSize(.small)
                     .tint(AppTheme.blue)
-                Text(launchingAppName.map { "正在打开 \($0)" } ?? "正在更新应用")
+                Text(launchingAppName.map { "正在打开 \($0)" }
+                    ?? uninstallingAppName.map { "正在卸载 \($0)" }
+                    ?? "正在更新应用")
                     .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(AppTheme.charcoal)
             }
@@ -690,6 +694,57 @@ struct ContentView: View {
         }
         .animation(.easeOut(duration: 0.16), value: store.isRefreshing)
         .animation(.easeOut(duration: 0.16), value: launchingAppName)
+        .animation(.easeOut(duration: 0.16), value: uninstallingAppName)
+    }
+
+    /// Start one uninstall operation and keep the retry target if only part of
+    /// the cleanup succeeds. The actual worker never runs on the main thread.
+    private func performUninstall(_ app: AppItem) {
+        guard uninstallingAppName == nil else { return }
+        uninstallingAppName = app.displayName
+        uninstallError = nil
+        AppActions.uninstall(
+            appURL: app.url,
+            bundleID: app.bundleID,
+            beforeFinderFallback: {
+                dismiss()   // Finder 的管理员认证弹窗不能被全屏层挡住
+            },
+            completion: { error in
+                uninstallingAppName = nil
+                if error == nil, store.customAppPaths().contains(app.id) {
+                    // A manually imported app is protected from automatic
+                    // layout pruning while its path is configured as custom.
+                    // Remove that source after a successful uninstall so the
+                    // next refresh cannot preserve a ghost record.
+                    store.removeCustomApp(path: app.id)
+                }
+                store.refreshAsync()
+                if let error {
+                    uninstallRetryTarget = app
+                    uninstallError = error
+                    // 覆盖层可能已收起,重新唤起以展示错误
+                    (NSApp.delegate as? AppDelegate)?.showOverlay()
+                } else {
+                    uninstallRetryTarget = nil
+                }
+            }
+        )
+    }
+
+    private func prepareUninstall(_ app: AppItem) {
+        guard uninstallingAppName == nil else { return }
+        uninstallTarget = app
+        uninstallResidualCount = nil
+        let appID = app.id
+        let appURL = app.url
+        let bundleID = app.bundleID
+        DispatchQueue.global(qos: .utility).async {
+            let count = AppActions.residualPaths(appURL: appURL, bundleID: bundleID).count
+            DispatchQueue.main.async {
+                guard uninstallTarget?.id == appID else { return }
+                uninstallResidualCount = count
+            }
+        }
     }
 
     @ViewBuilder
@@ -774,6 +829,13 @@ struct ContentView: View {
     /// 应用右键菜单(网格/搜索结果/文件夹面板通用)。
     @ViewBuilder
     private func appContextMenu(_ app: AppItem) -> some View {
+        Button {
+            store.toggleFavorite(app.id)
+        } label: {
+            Label(store.isFavorite(app.id) ? "取消收藏" : "收藏置顶",
+                  systemImage: store.isFavorite(app.id) ? "star.slash" : "star")
+        }
+        Divider()
         Button("在 Finder 中显示") {
             NSWorkspace.shared.activateFileViewerSelecting([app.url])
             dismiss()   // 覆盖层在最顶层,不关掉会把 Finder 窗口完全挡住
@@ -807,11 +869,19 @@ struct ContentView: View {
         Button("隐藏") {
             store.setHidden(app.id, hidden: true)
         }
-        // 系统应用受 SIP 保护不可卸载,不显示入口
-        if !app.id.hasPrefix("/System/") {
+        let isCustomStandaloneProgram = app.url.pathExtension.caseInsensitiveCompare("app") != .orderedSame
+            && store.customAppPaths().contains(app.id)
+        if isCustomStandaloneProgram {
+            Divider()
+            Button("从启动台移除") {
+                store.removeCustomApp(path: app.id)
+            }
+        }
+        // 系统应用受 SIP 保护不可卸载;独立可执行文件也不显示卸载入口
+        if AppActions.isUninstallableApp(at: app.url) {
             Divider()
             Button("卸载…") {
-                uninstallTarget = app
+                prepareUninstall(app)
             }
         }
     }
@@ -872,13 +942,33 @@ struct ContentView: View {
     // MARK: - 搜索框
 
     private var searchField: some View {
-        TextField("搜索应用…", text: $state.query)
-            .textFieldStyle(.plain)
-            .focused($searchFocused)
-            .font(.system(size: 15))
-            .foregroundStyle(AppTheme.charcoal)
-            .tint(AppTheme.blue)
-            .environment(\.colorScheme, .light)
+        HStack(spacing: 9) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(AppTheme.secondaryText)
+            TextField("搜索应用…", text: $state.query)
+                .textFieldStyle(.plain)
+                .focused($searchFocused)
+                .font(.system(size: 15))
+                .foregroundStyle(AppTheme.charcoal)
+                .tint(AppTheme.blue)
+            Button {
+                state.showFavoritesOnly.toggle()
+                state.highlightedAppID = nil
+            } label: {
+                Image(systemName: state.showFavoritesOnly ? "star.fill" : "star")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(state.showFavoritesOnly ? .yellow : AppTheme.secondaryText)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(state.showFavoritesOnly ? "显示全部应用" : "只显示收藏")
+            .accessibilityLabel(state.showFavoritesOnly ? "显示全部应用" : "只显示收藏")
+        }
+        .font(.system(size: 15))
+        .foregroundStyle(AppTheme.charcoal)
+        .environment(\.colorScheme, .light)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .frame(maxWidth: 460)
@@ -1969,10 +2059,21 @@ struct ContentView: View {
     @ViewBuilder
     private func appCell(_ app: AppItem, handlesTap: Bool = true) -> some View {
         let cell = VStack(spacing: 8) {
-            Image(nsImage: app.icon)
-                .resizable()
-                .interpolation(.medium)
-                .frame(width: gridIconSize, height: gridIconSize)
+            ZStack(alignment: .topTrailing) {
+                Image(nsImage: app.icon)
+                    .resizable()
+                    .interpolation(.medium)
+                    .frame(width: gridIconSize, height: gridIconSize)
+                if store.isFavorite(app.id) {
+                    Image(systemName: "star.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.yellow)
+                        .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+                        .padding(3)
+                        .allowsHitTesting(false)
+                }
+            }
+            .frame(width: gridIconSize, height: gridIconSize)
             Text(app.displayName)
                 .font(.system(size: gridLabelFontSize))
                 .foregroundStyle(.primary)
@@ -2044,6 +2145,35 @@ struct ContentView: View {
 
     // MARK: - 搜索结果(扁平网格)
 
+    @ViewBuilder
+    private var favoritesGrid: some View {
+        let favorites = store.favoriteItems()
+        if favorites.isEmpty {
+            VStack(spacing: 10) {
+                Image(systemName: "star")
+                    .font(.system(size: 34))
+                    .foregroundStyle(.secondary)
+                Text("还没有收藏应用")
+                    .font(.system(size: 15))
+                    .foregroundStyle(.secondary)
+                Text("在应用上右键即可收藏置顶")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVGrid(columns: gridColumns, spacing: 30) {
+                    ForEach(favorites) { app in
+                        appCell(app).id(app.id)
+                    }
+                }
+                .padding(.horizontal, 60)
+                .padding(.bottom, 60)
+            }
+        }
+    }
+
     private var searchResults: some View {
         Group {
             if filtered.isEmpty {
@@ -2085,6 +2215,7 @@ struct ContentView: View {
         withAnimation(.easeOut(duration: 0.12)) {
             launchingAppName = app.displayName
         }
+        AppUsageStore.shared.record(appID: app.id)
         AppActions.launch(app.url)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
             dismiss()

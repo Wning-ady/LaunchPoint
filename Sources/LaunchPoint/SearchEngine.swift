@@ -225,17 +225,27 @@ enum SearchEngine {
 
     /// 对应用列表执行三路匹配(显示名/默认名/别名),按分数降序、同分按名短优先。
     /// 查询会先去除首尾空白;去除后为空则原样返回全部应用。
-    static func rank(_ query: String, in apps: [AppItem]) -> [AppItem] {
+    static func rank(_ query: String, in apps: [AppItem],
+                     favoriteRanks: [String: Int] = [:],
+                     usageScores: [String: Int] = [:]) -> [AppItem] {
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return apps }
+        let hasPriority = !favoriteRanks.isEmpty || !usageScores.isEmpty
         var hasher = Hasher()
         hasher.combine(apps.count)
         for app in apps {
             hasher.combine(app.id)
+            // The localized display name can change after a refresh (for
+            // example when the system language or an app update changes its
+            // Info.plist). Include it so a previous ranking cannot survive
+            // with stale match scores.
+            hasher.combine(app.name)
             hasher.combine(app.alias ?? "")
         }
         let cacheKey = "\(q.lowercased())#\(hasher.finalize())"
-        if let cached = rankCache[cacheKey] { return cached }
+        // Priority inputs change independently of the app list, so bypass the
+        // generic query cache when favorites or usage scores are supplied.
+        if !hasPriority, let cached = rankCache[cacheKey] { return cached }
 
         let result = apps
             .compactMap { app -> (AppItem, Int)? in
@@ -247,15 +257,23 @@ enum SearchEngine {
             }
             .sorted { a, b in
                 if a.1 != b.1 { return a.1 > b.1 }
+                let favoriteA = favoriteRanks[a.0.id] ?? Int.max
+                let favoriteB = favoriteRanks[b.0.id] ?? Int.max
+                if favoriteA != favoriteB { return favoriteA < favoriteB }
+                let usageA = usageScores[a.0.id] ?? 0
+                let usageB = usageScores[b.0.id] ?? 0
+                if usageA != usageB { return usageA > usageB }
                 if a.0.displayName.count != b.0.displayName.count {
                     return a.0.displayName.count < b.0.displayName.count
                 }
                 return a.0.displayName.localizedCaseInsensitiveCompare(b.0.displayName) == .orderedAscending
             }
             .map(\.0)
-        rankCache[cacheKey] = result
-        if rankCache.count > 32, let first = rankCache.keys.first {
-            rankCache.removeValue(forKey: first)
+        if !hasPriority {
+            rankCache[cacheKey] = result
+            if rankCache.count > 32, let first = rankCache.keys.first {
+                rankCache.removeValue(forKey: first)
+            }
         }
         return result
     }
