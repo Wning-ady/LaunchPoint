@@ -151,7 +151,10 @@ struct RawPinchDetector {
 /// Observes raw trackpad contact frames for four/five-finger pinch gestures.
 /// The private framework is loaded at runtime, so failure remains a graceful
 /// feature fallback instead of preventing LaunchPoint from starting.
-final class RawTrackpadMonitor {
+// Contact callbacks arrive on a private-framework thread. Mutable callback
+// state is protected by `lock`, while timer lifecycle is confined to the main
+// queue, so the monitor can be shared safely across those execution contexts.
+final class RawTrackpadMonitor: @unchecked Sendable {
     static let shared = RawTrackpadMonitor()
 
     private struct MTPoint {

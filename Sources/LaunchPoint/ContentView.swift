@@ -24,6 +24,31 @@ private struct VisualEffectBackground: NSViewRepresentable {
     }
 }
 
+/// 高频拖动坐标与主网格状态分离。只有承载浮动图标的子视图观察这个对象，
+/// 指针移动不会让整个 ContentView 重新求值。
+private final class DragPoint: ObservableObject {
+    @Published var location: CGPoint = .zero
+}
+
+private final class DragCoordinates {
+    var paging: CGPoint = .zero
+    var scrolling: CGPoint = .zero
+    var panel: CGPoint = .zero
+}
+
+private struct DragFloat<Content: View>: View {
+    @ObservedObject var point: DragPoint
+    let grab: CGSize
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            .position(x: point.location.x - grab.width,
+                      y: point.location.y - grab.height)
+            .allowsHitTesting(false)
+    }
+}
+
 /// 把设置面板的位置状态隔离在覆盖层内部。拖动标题栏时只重绘浮层，底下的
 /// 应用网格不会跟着每个鼠标事件重新求值。
 private final class SettingsPanelContainerView: NSView {
@@ -201,9 +226,15 @@ struct ContentView: View {
         let cell: Int
     }
 
+    /// 预览布局里某个条目所在的页与页内槽位。预先建表后，拖动时每格只需 O(1) 查表，
+    /// 不必在每帧、每个格子上重复扫描整个预览数组。
+    private struct PreviewSlot: Equatable {
+        let page: Int
+        let slot: Int
+    }
+
     // MARK: 拖拽排序状态(网格内:应用或文件夹图块)
     @State private var draggingEntry: PageEntry?
-    @State private var dragLocation: CGPoint = .zero       // "pagingArea" 坐标
     @State private var dragGrabOffset: CGSize = .zero
     @State private var dropTarget: DropTarget?
     @State private var dragOrigin: OriginCell?             // 起拖格
@@ -215,10 +246,14 @@ struct ContentView: View {
     @State private var pagingAreaFrame: CGRect = .zero     // 分页容器的窗口坐标 frame
     @State private var previewPages: [[PageEntry]]?
     @State private var dragBasePages: [[PageEntry]]?
+    @State private var pagedPreviewSlots: [String: PreviewSlot] = [:]   // 预览落点索引表
 
     // MARK: 从文件夹面板拖出
     @State private var panelDragApp: AppItem?              // 面板内起拖的应用
-    @State private var panelDragLocation: CGPoint = .zero  // 窗口坐标
+    @State private var pagingDragPoint = DragPoint()
+    @State private var scrollingDragPoint = DragPoint()
+    @State private var panelDragPoint = DragPoint()
+    @State private var dragCoordinates = DragCoordinates()
     @State private var folderPanelHidden = false           // 拖出边界后面板隐去(视图保留,手势不断)
     @State private var panelFrame: CGRect = .zero          // 面板窗口坐标 frame
     @State private var hoveredEntryID: String?             // 鼠标悬停的图标,提供轻量的反馈
@@ -226,7 +261,6 @@ struct ContentView: View {
     @State private var scrollingEntryFrames: [String: CGRect] = [:]
     @State private var panelScrollingTarget: ScrollingDropTarget?
     @State private var verticalDraggingEntry: PageEntry?
-    @State private var verticalDragLocation: CGPoint = .zero
     @State private var verticalDropTarget: ScrollingDropTarget?
     @State private var scrollingPreviewEntries: [PageEntry]?
     @State private var scrollingDragBaseEntries: [PageEntry]?
@@ -234,6 +268,29 @@ struct ContentView: View {
     @State private var lastVerticalAutoScroll = Date.distantPast
     @State private var lastPagingDragUpdate: TimeInterval = 0
     @State private var lastVerticalDragUpdate: TimeInterval = 0
+
+    // The coordinate store is intentionally non-observable. The floating icon
+    // observes the matching DragPoint, while the grid reads these values only
+    // when resolving a drop target. Updating the pointer must not invalidate
+    // ContentView and rebuild the whole grid.
+    private var dragLocation: CGPoint { dragCoordinates.paging }
+    private var verticalDragLocation: CGPoint { dragCoordinates.scrolling }
+    private var panelDragLocation: CGPoint { dragCoordinates.panel }
+
+    private func updatePagingDragLocation(_ location: CGPoint) {
+        dragCoordinates.paging = location
+        pagingDragPoint.location = location
+    }
+
+    private func updateScrollingDragLocation(_ location: CGPoint) {
+        dragCoordinates.scrolling = location
+        scrollingDragPoint.location = location
+    }
+
+    private func updatePanelDragLocation(_ location: CGPoint) {
+        dragCoordinates.panel = location
+        panelDragPoint.location = location
+    }
 
     private var draggingID: String? {
         draggingEntry?.id ?? verticalDraggingEntry?.id ?? panelDragApp?.id
@@ -282,22 +339,16 @@ struct ContentView: View {
         return nil
     }
 
-    private var insertionMarker: some View {
-        Capsule().fill(AppTheme.blue)
-            .frame(width: 3, height: gridIconSize)
-            .allowsHitTesting(false)
-    }
-
-    private var pagedInsertionAnchor: (id: String, after: Bool)? {
-        guard case .insert = dropTarget,
-              let source = draggingEntry,
-              let previewPages else { return nil }
-        for page in previewPages {
-            guard let sourceIndex = page.firstIndex(where: { $0.id == source.id }) else { continue }
-            if sourceIndex + 1 < page.count { return (page[sourceIndex + 1].id, false) }
-            if sourceIndex > 0 { return (page[sourceIndex - 1].id, true) }
-        }
-        return nil
+    /// 拖拽期间的动效参数，取自原生 Launchpad 复刻实现
+    /// 让位必须短于连续拖动的目标切换间隔，否则每次换槽都会重新启动一条
+    /// 尚未完成的弹簧，图标会明显追不上指针。
+    private enum DragMotion {
+        static let reflow = Animation.interactiveSpring(response: 0.16,
+                                                        dampingFraction: 0.86,
+                                                        blendDuration: 0.06)
+        static let hover = Animation.interactiveSpring(response: 0.18,
+                                                       dampingFraction: 0.86,
+                                                       blendDuration: 0.06)
     }
 
     /// 分页与搜索结果共用固定列数:键盘导航需要确定的网格几何。
@@ -426,6 +477,17 @@ struct ContentView: View {
         scrollingDragBaseEntries ?? store.pages.flatMap { $0 }
     }
 
+    /// 预览顺序 → 槽位索引。拖动中每个图标只需查一次表，避免每格线性扫描整个列表。
+    private var scrollingPreviewIndexMap: [String: Int] {
+        guard let preview = scrollingPreviewEntries else { return [:] }
+        var map: [String: Int] = [:]
+        map.reserveCapacity(preview.count)
+        for (index, entry) in preview.enumerated() {
+            map[entry.id] = index
+        }
+        return map
+    }
+
     /// 搜索结果:前缀/词首/首字母/缩写/拼音多路匹配,按匹配度排序。
     private var filtered: [AppItem] {
         SearchEngine.rank(
@@ -462,9 +524,9 @@ struct ContentView: View {
 
             // 面板内拖动阶段的浮动图标(根层坐标 = 窗口坐标)
             if let app = panelDragApp, !folderPanelHidden {
-                floatingIcon(.app(app))
-                    .position(panelDragLocation)
-                    .allowsHitTesting(false)
+                DragFloat(point: panelDragPoint, grab: .zero) {
+                    floatingIcon(.app(app))
+                }
                     .zIndex(30)
             }
 
@@ -1012,7 +1074,7 @@ struct ContentView: View {
                             // hover 让十几页离屏 NSImage 一起参与布局。
                             if abs(pageIndex - state.currentPage) <= 1
                                 || displayPages[pageIndex].contains(where: { $0.id == draggingEntry?.id }) {
-                                pageView(displayPages[pageIndex], width: width)
+                                pageView(pageIndex: pageIndex, width: width)
                             } else {
                                 Color.clear
                             }
@@ -1025,10 +1087,9 @@ struct ContentView: View {
 
                 // 跟随指针的浮动图标(拖拽中)
                 if let entry = draggingEntry {
-                    floatingIcon(entry)
-                        .position(x: dragLocation.x - dragGrabOffset.width,
-                                  y: dragLocation.y - dragGrabOffset.height)
-                        .allowsHitTesting(false)
+                    DragFloat(point: pagingDragPoint, grab: dragGrabOffset) {
+                        floatingIcon(entry)
+                    }
                         .zIndex(10)
                 }
             }
@@ -1049,12 +1110,18 @@ struct ContentView: View {
         // GeometryReader 位于剩余的主内容区域，而不是 ScrollView 内容内部。
         // 这样它拿到的是稳定的视口高度，不会被连续网格的内容高度反向撑大。
         GeometryReader { geo in
+            let previewIndex = scrollingPreviewIndexMap
             ScrollViewReader { scrollProxy in
                 ZStack(alignment: .topLeading) {
                     ScrollView(.vertical, showsIndicators: true) {
                         LazyVGrid(columns: gridColumns, spacing: gridRowSpacing) {
-                            ForEach(scrollingEntries) { entry in
-                                scrollingEntryCell(entry, scrollProxy: scrollProxy)
+                            // 拖动中 ForEach 顺序固定为起拖时的基准，只让每个图标用 offset
+                            // 挪到预览槽位：既不重建正在拖的视图，也不依赖 LazyVGrid 的重排动画。
+                            ForEach(Array(scrollingEntries.enumerated()), id: \.element.id) { index, entry in
+                                scrollingEntryCell(entry,
+                                                   layoutIndex: index,
+                                                   targetIndex: previewIndex[entry.id] ?? index,
+                                                   scrollProxy: scrollProxy)
                                     .id(entry.id)
                             }
                         }
@@ -1070,17 +1137,14 @@ struct ContentView: View {
                     .contextMenu { blankAreaMenu }
 
                     if let entry = verticalDraggingEntry {
-                        floatingIcon(entry)
-                            .position(x: verticalDragLocation.x - scrollingViewportFrame.minX,
-                                      y: verticalDragLocation.y - scrollingViewportFrame.minY)
-                            .offset(x: -dragGrabOffset.width, y: -dragGrabOffset.height)
-                            .allowsHitTesting(false)
+                        DragFloat(point: scrollingDragPoint, grab: dragGrabOffset) {
+                            floatingIcon(entry)
+                        }
                             .zIndex(20)
                     } else if let app = panelDragApp, folderPanelHidden {
-                        floatingIcon(.app(app))
-                            .position(x: panelDragLocation.x - scrollingViewportFrame.minX,
-                                      y: panelDragLocation.y - scrollingViewportFrame.minY)
-                            .allowsHitTesting(false)
+                        DragFloat(point: scrollingDragPoint, grab: .zero) {
+                            floatingIcon(.app(app))
+                        }
                             .zIndex(20)
                     }
                 }
@@ -1105,23 +1169,32 @@ struct ContentView: View {
     }
 
     private func scrollingEntryCell(_ entry: PageEntry,
+                                    layoutIndex: Int,
+                                    targetIndex: Int,
                                     scrollProxy: ScrollViewProxy) -> some View {
-        entryCell(entry, allowsReordering: false, handlesTap: false)
+        // 让位：ForEach 顺序固定为起拖时的基准，图标只是用 offset 从基准槽滑到预览槽。
+        // offset 是 animatable 的属性，弹簧位移一定生效，不会出现 LazyVGrid 重排时的瞬移。
+        let columns = max(1, gridColumnCount)
+        let columnShift = targetIndex % columns - layoutIndex % columns
+        let rowShift = targetIndex / columns - layoutIndex / columns
+        let offsetX = CGFloat(columnShift) * (gridCellWidth + gridColumnSpacing)
+        let offsetY = CGFloat(rowShift) * (gridCellHeight + gridRowSpacing)
+
+        return entryCell(entry, allowsReordering: false, handlesTap: true)
             .frame(width: gridCellWidth, height: gridCellHeight)
-            .opacity(draggingID == entry.id ? 0.28 : 1)
+            // 原位留一个淡出的空槽，浮动图标才有“被拿起来”的层次感。
+            .opacity(draggingID == entry.id ? 0.12 : 1)
+            .overlay {
+                if draggingID == entry.id {
+                    RoundedRectangle(cornerRadius: 18)
+                        .strokeBorder(AppTheme.paper.opacity(0.30),
+                                      style: StrokeStyle(lineWidth: 1.5, dash: [5, 5]))
+                        .padding(6)
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
+                }
+            }
             .zIndex(scrollingDropTargetID == entry.id ? 1 : 0)
-            .overlay(alignment: .leading) {
-                if let target = verticalDropTarget ?? panelScrollingTarget,
-                   target.entryID == entry.id, target.zone == .before {
-                    insertionMarker.offset(x: -5)
-                }
-            }
-            .overlay(alignment: .trailing) {
-                if let target = verticalDropTarget ?? panelScrollingTarget,
-                   target.entryID == entry.id, target.zone == .after {
-                    insertionMarker.offset(x: 5)
-                }
-            }
             .overlay(alignment: .topTrailing) {
                 if scrollingDropTargetID == entry.id,
                    verticalDropTarget?.zone == .group || panelScrollingTarget?.zone == .group {
@@ -1136,6 +1209,7 @@ struct ContentView: View {
                 }
             }
             .highPriorityGesture(verticalDragGesture(entry, scrollProxy: scrollProxy))
+            // 上报的是未位移的基准槽，落点判定才不会被正在让位的图标带偏。
             .background {
                 GeometryReader { geometry in
                     Color.clear.preference(
@@ -1144,6 +1218,8 @@ struct ContentView: View {
                     )
                 }
             }
+            .offset(x: offsetX, y: offsetY)
+            .animation(DragMotion.reflow, value: targetIndex)
     }
 
     private func scrollingDropZone(at location: CGPoint,
@@ -1162,7 +1238,7 @@ struct ContentView: View {
 
     private func verticalDragGesture(_ entry: PageEntry,
                                      scrollProxy: ScrollViewProxy) -> some Gesture {
-        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+        DragGesture(minimumDistance: 6, coordinateSpace: .global)
             .onChanged { drag in
                 guard !AppState.shared.dragInhibited else { return }
                 if verticalDraggingEntry == nil {
@@ -1178,9 +1254,11 @@ struct ContentView: View {
                     AppState.shared.isDragging = true
                 }
                 let now = ProcessInfo.processInfo.systemUptime
+                // 拖动状态更新限制在 60Hz。更高频的事件只会重复触发整棵 SwiftUI
+                // 视图树求值，不能让低于 60Hz 的布局/动画更快，反而会增加卡顿。
                 guard now - lastVerticalDragUpdate >= (1.0 / 60.0) else { return }
                 lastVerticalDragUpdate = now
-                verticalDragLocation = drag.location
+                updateScrollingDragLocation(drag.location)
                 updateVerticalTarget(at: drag.location, source: entry)
                 autoScrollVertically(at: drag.location, proxy: scrollProxy)
             }
@@ -1196,7 +1274,7 @@ struct ContentView: View {
                     // again here changed the anchor without giving SwiftUI a frame to draw
                     // the new marker, so the persisted item landed one slot too early.
                     if verticalDropTarget == nil {
-                        verticalDragLocation = drag.location
+                        updateScrollingDragLocation(drag.location)
                         updateVerticalTarget(at: drag.location, source: entry)
                     }
                     commitVerticalDrag()
@@ -1208,34 +1286,50 @@ struct ContentView: View {
         if scrollingEntryFrames[source.id]?.contains(location) == true {
             verticalDropTarget = nil
             scrollingDropTargetID = nil
+            // 回到原位等同取消让位：图标弹回起拖时的排列。
+            if scrollingPreviewEntries != nil {
+                scrollingPreviewEntries = scrollingDragBaseEntries
+            }
             return
         }
-        let match = scrollingEntryFrames
-            .filter { $0.key != source.id }
-            .min { lhs, rhs in
-                let left = pow(lhs.value.midX - location.x, 2) + pow(lhs.value.midY - location.y, 2)
-                let right = pow(rhs.value.midX - location.x, 2) + pow(rhs.value.midY - location.y, 2)
-                return left < right
+        // 单循环找最近槽位：省掉每帧 filter 的数组分配与 pow 调用，
+        // 快速来回拖动时这条路径每帧都会走一次。
+        var nearestID: String?
+        var nearestFrame: CGRect?
+        var nearestDistance = CGFloat.greatestFiniteMagnitude
+        for (id, frame) in scrollingEntryFrames where id != source.id {
+            let dx = frame.midX - location.x
+            let dy = frame.midY - location.y
+            let distance = dx * dx + dy * dy
+            if distance < nearestDistance {
+                nearestDistance = distance
+                nearestID = id
+                nearestFrame = frame
             }
+        }
         let baseEntries = scrollingDragBaseEntries ?? store.pages.flatMap { $0 }
-        guard let match,
-              let target = baseEntries.first(where: { $0.id == match.key }) else {
+        guard let nearestID, let nearestFrame,
+              let target = baseEntries.first(where: { $0.id == nearestID }) else {
+            if scrollingPreviewEntries != nil {
+                scrollingPreviewEntries = scrollingDragBaseEntries
+            }
             return
         }
 
-        let local = CGPoint(x: location.x - match.value.minX,
-                            y: location.y - match.value.minY)
-        var zone = scrollingDropZone(at: local, size: match.value.size, source: source)
-        if !match.value.insetBy(dx: -8, dy: -8).contains(location), zone == .group {
-            zone = location.x < match.value.midX ? .before : .after
+        let local = CGPoint(x: location.x - nearestFrame.minX,
+                            y: location.y - nearestFrame.minY)
+        var zone = scrollingDropZone(at: local, size: nearestFrame.size, source: source)
+        if !nearestFrame.insetBy(dx: -8, dy: -8).contains(location), zone == .group {
+            zone = location.x < nearestFrame.midX ? .before : .after
         }
         let next = ScrollingDropTarget(entryID: target.id, zone: zone)
         guard next != verticalDropTarget else { return }
         verticalDropTarget = next
         scrollingDropTargetID = zone == .group ? target.id : nil
 
-        let preview = scrollingPreview(source: source, target: target, zone: zone)
-        scrollingPreviewEntries = preview
+        // 让位动画由每个格子的 .animation(value:) 驱动。这里不再包事务：
+        // 快速来回拖动时每帧新建事务会不断打断正在跑的弹簧，反而更卡。
+        scrollingPreviewEntries = scrollingPreview(source: source, target: target, zone: zone)
     }
 
     private func scrollingPreview(source: PageEntry,
@@ -1269,10 +1363,17 @@ struct ContentView: View {
 
         let ordered = scrollingEntries
         guard !ordered.isEmpty else { return }
-        let visible = scrollingEntryFrames
-            .filter { scrollingViewportFrame.intersects($0.value) }
-            .compactMap { frame in ordered.firstIndex(where: { $0.id == frame.key }) }
-        let anchorIndex = direction < 0 ? visible.min() : visible.max()
+        // 单次遍历取可见区间：原来是 filter + compactMap + 每个 frame 再线性查找索引，
+        // 应用多时这一步是 O(n²)，拖动到边缘时会直接拖慢主线程。
+        var firstVisible: Int?
+        var lastVisible: Int?
+        for (index, entry) in ordered.enumerated() {
+            guard let frame = scrollingEntryFrames[entry.id],
+                  scrollingViewportFrame.intersects(frame) else { continue }
+            if firstVisible == nil { firstVisible = index }
+            lastVisible = index
+        }
+        let anchorIndex = direction < 0 ? firstVisible : lastVisible
         guard let anchorIndex else { return }
         let destination = min(max(anchorIndex + direction * max(1, gridColumnCount), 0),
                               ordered.count - 1)
@@ -1287,9 +1388,13 @@ struct ContentView: View {
             finishVerticalDrag()
             return
         }
-        scrollingPreviewEntries = nil
-        scrollingDragBaseEntries = nil
-        performScrollingDrop(source: source, onto: target, zone: targetInfo.zone)
+        // 松手时“基准布局 + offset”已经与落盘后的布局重合，这里关掉动画直接对齐，
+        // 否则图标会先滑到预览槽位、再被新布局拉一次，看起来像抖了一下。
+        withTransaction(Transaction(animation: nil)) {
+            scrollingPreviewEntries = nil
+            scrollingDragBaseEntries = nil
+            performScrollingDrop(source: source, onto: target, zone: targetInfo.zone)
+        }
         finishVerticalDrag()
     }
 
@@ -1371,41 +1476,48 @@ struct ContentView: View {
             }
     }
 
-    private func pageView(_ entries: [PageEntry], width: CGFloat) -> some View {
-        LazyVGrid(columns: gridColumns, spacing: gridRowSpacing) {
-            ForEach(entries) { entry in
-                entryCell(entry)
-                    .frame(width: gridCellWidth, height: gridCellHeight)
-                    .overlay(alignment: .leading) {
-                        if let target = pagedInsertionAnchor,
-                           target.id == entry.id, !target.after {
-                            insertionMarker.offset(x: -5)
-                        }
-                    }
-                    .overlay(alignment: .trailing) {
-                        if let target = pagedInsertionAnchor,
-                           target.id == entry.id, target.after {
-                            insertionMarker.offset(x: 5)
-                        }
-                    }
-                    // onto 只显示静态落点提示，避免放大动画与最终槽位产生视觉偏差。
-                    .overlay(alignment: .topTrailing) {
-                        if draggingEntry != nil && ontoHighlightID == entry.id {
-                            Image(systemName: "folder.badge.plus")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(AppTheme.blue)
-                                .padding(6)
-                                .background(.regularMaterial, in: Circle())
-                                .overlay(Circle().stroke(AppTheme.blue.opacity(0.24), lineWidth: 1))
-                                .shadow(color: AppTheme.blue.opacity(0.2), radius: 5, y: 2)
-                                .allowsHitTesting(false)
-                        }
-                    }
+    private func pageView(pageIndex: Int, width: CGFloat) -> some View {
+        let entries = pageIndex < store.pages.count ? store.pages[pageIndex] : []
+        return LazyVGrid(columns: gridColumns, spacing: gridRowSpacing) {
+            ForEach(Array(entries.enumerated()), id: \.element.id) { localIndex, entry in
+                pagedEntryCell(entry, localIndex: localIndex, pageIndex: pageIndex)
             }
         }
         .frame(width: gridContentWidth)
         .padding(.top, Self.gridTop)
         .frame(width: width, alignment: .top)
+    }
+
+    /// 分页网格里的一格：按预览槽位让位。跨页移动不在这里位移（等翻页后页内重算），
+    /// 避免图标被页码容器裁切或与相邻页重叠。
+    private func pagedEntryCell(_ entry: PageEntry,
+                                localIndex: Int,
+                                pageIndex: Int) -> some View {
+        let columns = max(1, gridColumnCount)
+        let target = pagedPreviewSlots[entry.id]
+        let targetSlot = target?.page == pageIndex ? (target?.slot ?? localIndex) : localIndex
+        let columnShift = targetSlot % columns - localIndex % columns
+        let rowShift = targetSlot / columns - localIndex / columns
+        let offsetX = CGFloat(columnShift) * (gridCellWidth + gridColumnSpacing)
+        let offsetY = CGFloat(rowShift) * (gridCellHeight + gridRowSpacing)
+
+        return entryCell(entry)
+            .frame(width: gridCellWidth, height: gridCellHeight)
+            // onto 只显示静态落点提示，避免放大动画与最终槽位产生视觉偏差。
+            .overlay(alignment: .topTrailing) {
+                if draggingEntry != nil && ontoHighlightID == entry.id {
+                    Image(systemName: "folder.badge.plus")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(AppTheme.blue)
+                        .padding(6)
+                        .background(.regularMaterial, in: Circle())
+                        .overlay(Circle().stroke(AppTheme.blue.opacity(0.24), lineWidth: 1))
+                        .shadow(color: AppTheme.blue.opacity(0.2), radius: 5, y: 2)
+                        .allowsHitTesting(false)
+                }
+            }
+            .offset(x: offsetX, y: offsetY)
+            .animation(DragMotion.reflow, value: targetSlot)
     }
 
     @ViewBuilder
@@ -1416,17 +1528,17 @@ struct ContentView: View {
             switch entry {
             case .app(let app):
                 if allowsReordering {
-                    appCell(app, handlesTap: false)
+                    appCell(app, handlesTap: true)
                         // 拖拽中的条目在预览槽位处半透明显示,作为落点指示
-                        .opacity(app.id == draggingID ? 0.35 : 1)
+                        .opacity(app.id == draggingID ? 0.18 : 1)
                         .highPriorityGesture(iconDragGesture(entry))
                 } else {
                     appCell(app, handlesTap: handlesTap)
                 }
             case .folder(let info):
                 if allowsReordering {
-                    folderCell(info, handlesTap: false)
-                        .opacity(info.id == draggingID ? 0.35 : 1)
+                    folderCell(info, handlesTap: true)
+                        .opacity(info.id == draggingID ? 0.18 : 1)
                         .highPriorityGesture(iconDragGesture(entry))   // 文件夹图块同样可拖动排序
                 } else {
                     folderCell(info, handlesTap: handlesTap)
@@ -1484,7 +1596,7 @@ struct ContentView: View {
             hoveredEntryID = inside ? info.id : nil
         }
         .animation(AppState.shared.isDragging
-                   ? nil : .spring(response: 0.18, dampingFraction: 0.82),
+                   ? nil : DragMotion.hover,
                    value: cellScale(for: info.id))
         .contextMenu { folderContextMenu(info) }
         if handlesTap {
@@ -1556,7 +1668,7 @@ struct ContentView: View {
                     panelDragApp = app
                     AppState.shared.isDragging = true
                 }
-                panelDragLocation = value.location
+                updatePanelDragLocation(value.location)
 
                 if !folderPanelHidden {
                     // 仍在面板内:只跟随浮动图标
@@ -1575,8 +1687,8 @@ struct ContentView: View {
                     updatePanelScrollingTarget(at: value.location, source: app)
                     return
                 }
-                dragLocation = CGPoint(x: value.location.x - pagingAreaFrame.minX,
-                                       y: value.location.y - pagingAreaFrame.minY)
+                updatePagingDragLocation(CGPoint(x: value.location.x - pagingAreaFrame.minX,
+                                                 y: value.location.y - pagingAreaFrame.minY))
                 evaluateDragTarget()
                 handleEdgeHover()
             }
@@ -1594,8 +1706,8 @@ struct ContentView: View {
                         state.closeFolder()
                         return
                     }
-                    dragLocation = CGPoint(x: drag.location.x - pagingAreaFrame.minX,
-                                           y: drag.location.y - pagingAreaFrame.minY)
+                    updatePagingDragLocation(CGPoint(x: drag.location.x - pagingAreaFrame.minX,
+                                                           y: drag.location.y - pagingAreaFrame.minY))
                     evaluateDragTarget()
                     commitDrag()                     // 含 finishDrag(清 panel 状态)
                     state.closeFolder()              // 拖出后关闭面板(可能已自动解散)
@@ -1611,22 +1723,30 @@ struct ContentView: View {
     }
 
     private func updatePanelScrollingTarget(at location: CGPoint, source: AppItem) {
-        let match = scrollingEntryFrames.min { lhs, rhs in
-            let left = pow(lhs.value.midX - location.x, 2) + pow(lhs.value.midY - location.y, 2)
-            let right = pow(rhs.value.midX - location.x, 2) + pow(rhs.value.midY - location.y, 2)
-            return left < right
+        var nearestKey: String?
+        var nearestFrame: CGRect?
+        var nearestDistance = CGFloat.greatestFiniteMagnitude
+        for (id, frame) in scrollingEntryFrames {
+            let dx = frame.midX - location.x
+            let dy = frame.midY - location.y
+            let distance = dx * dx + dy * dy
+            if distance < nearestDistance {
+                nearestDistance = distance
+                nearestKey = id
+                nearestFrame = frame
+            }
         }
-        guard let match,
-        let target = store.pages.flatMap({ $0 }).first(where: { $0.id == match.key }) else {
+        guard let nearestKey, let nearestFrame,
+              let target = store.pages.flatMap({ $0 }).first(where: { $0.id == nearestKey }) else {
             panelScrollingTarget = nil
             scrollingDropTargetID = nil
             return
         }
 
-        let local = CGPoint(x: location.x - match.value.minX,
-                            y: location.y - match.value.minY)
+        let local = CGPoint(x: location.x - nearestFrame.minX,
+                            y: location.y - nearestFrame.minY)
         let zone = scrollingDropZone(at: local,
-                                     size: match.value.size,
+                                     size: nearestFrame.size,
                                      source: .app(source))
         let next = ScrollingDropTarget(entryID: target.id, zone: zone)
         guard next != panelScrollingTarget else { return }
@@ -1641,8 +1761,12 @@ struct ContentView: View {
         let source = PageEntry.app(app)
         if let targetInfo = panelScrollingTarget,
            let target = store.pages.flatMap({ $0 }).first(where: { $0.id == targetInfo.entryID }) {
-            scrollingPreviewEntries = nil
-            performScrollingDrop(source: source, onto: target, zone: targetInfo.zone)
+            // 与网格内拖动一致：预览位与落盘位重合，关掉动画直接对齐。
+            withTransaction(Transaction(animation: nil)) {
+                scrollingPreviewEntries = nil
+                scrollingDragBaseEntries = nil
+                performScrollingDrop(source: source, onto: target, zone: targetInfo.zone)
+            }
         }
         panelDragApp = nil
         panelScrollingTarget = nil
@@ -1694,7 +1818,7 @@ struct ContentView: View {
     // MARK: - 图标拖拽排序
 
     private func iconDragGesture(_ entry: PageEntry) -> some Gesture {
-        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+        DragGesture(minimumDistance: 6, coordinateSpace: .global)
             .onChanged { value in
                 guard state.effectiveQuery.isEmpty,
                       state.openFolderID == nil else { return }   // 搜索态/文件夹展开不排序
@@ -1714,8 +1838,8 @@ struct ContentView: View {
                     // onEnded; recalculating here made the item land one slot
                     // before the visible insertion marker.
                     if dropTarget == nil {
-                        dragLocation = CGPoint(x: value.location.x - pagingAreaFrame.minX,
-                                               y: value.location.y - pagingAreaFrame.minY)
+                        updatePagingDragLocation(CGPoint(x: value.location.x - pagingAreaFrame.minX,
+                                                               y: value.location.y - pagingAreaFrame.minY))
                         evaluateDragTarget()
                     }
                     commitDrag()
@@ -1763,9 +1887,11 @@ struct ContentView: View {
             }
         }
         let now = ProcessInfo.processInfo.systemUptime
+        // 拖动状态更新限制在 60Hz。更高频的事件只会重复触发整棵 SwiftUI
+        // 视图树求值，不能让低于 60Hz 的布局/动画更快，反而会增加卡顿。
         guard isStarting || now - lastPagingDragUpdate >= (1.0 / 60.0) else { return }
         lastPagingDragUpdate = now
-        dragLocation = location
+        updatePagingDragLocation(location)
         evaluateDragTarget()
         handleEdgeHover()
     }
@@ -1831,6 +1957,10 @@ struct ContentView: View {
            index < store.pages[pageIndex].count,
            store.pages[pageIndex][index].id == entry.id {
             dropTarget = nil
+            if previewPages != nil {
+                previewPages = nil
+                pagedPreviewSlots = [:]
+            }
             return
         }
 
@@ -1908,21 +2038,26 @@ struct ContentView: View {
             preview.removeLast()
         }
         previewPages = preview
+        var slots: [String: PreviewSlot] = [:]
+        slots.reserveCapacity(preview.reduce(0) { $0 + $1.count })
+        for (page, entries) in preview.enumerated() {
+            for (slot, item) in entries.enumerated() {
+                slots[item.id] = PreviewSlot(page: page, slot: slot)
+            }
+        }
+        pagedPreviewSlots = slots
     }
 
     /// 拖到页面左右边缘短暂停留后自动翻页；停在边缘可连续跨页。
     private func handleEdgeHover() {
         let direction = edgeDirection()
-        guard direction != 0 else {
-            edgeFlipWork?.cancel()
-            edgeFlipWork = nil
-            edgeFlipDirection = 0
-            return
-        }
+        // 稳定状态直接返回：原来每帧都会 cancel 一次定时器并赋值，
+        // 指针在网格中间反复拖动时这些全是白做的。
         guard direction != edgeFlipDirection else { return }
         edgeFlipWork?.cancel()
         edgeFlipWork = nil
         edgeFlipDirection = direction
+        guard direction != 0 else { return }
         flipDraggedPage(direction)
         scheduleEdgeFlip(direction)
     }
@@ -1959,22 +2094,30 @@ struct ContentView: View {
     private func commitDrag() {
         AppState.shared.dragInhibited = false    // 一次按住结束
         if let entry = draggingEntry, let target = dropTarget {
-            switch target {
-            case .insert(let page, let slot):
-                if let previewPages {
-                    store.moveEntryToMatchPreview(entry.id, preview: previewPages)
-                } else {
-                    store.moveEntry(entry.id, toPage: page, slot: slot)
-                }
-            case .onto(_, let targetID):
-                // 只有拖应用才会产生 onto 落点(evaluateDragTarget 保证)
-                if case .app(let app) = entry {
-                    if store.isFolderID(targetID) {
-                        store.addToFolder(app.id, folderID: targetID)
-                    } else if targetID != app.id {
-                        store.createFolder(dragging: app.id,
-                                           onto: targetID,
-                                           name: "未命名文件夹")
+            // 与连续网格一致：先关掉预览与位移动画，再落盘，避免松手时二次位移。
+            // 预览顺序要在清空前取一份，保证落盘结果与用户看到的槽位一致。
+            let previewSnapshot = previewPages
+            withTransaction(Transaction(animation: nil)) {
+                previewPages = nil
+                pagedPreviewSlots = [:]
+                dragBasePages = nil
+                switch target {
+                case .insert(let page, let slot):
+                    if let previewSnapshot {
+                        store.moveEntryToMatchPreview(entry.id, preview: previewSnapshot)
+                    } else {
+                        store.moveEntry(entry.id, toPage: page, slot: slot)
+                    }
+                case .onto(_, let targetID):
+                    // 只有拖应用才会产生 onto 落点(evaluateDragTarget 保证)
+                    if case .app(let app) = entry {
+                        if store.isFolderID(targetID) {
+                            store.addToFolder(app.id, folderID: targetID)
+                        } else if targetID != app.id {
+                            store.createFolder(dragging: app.id,
+                                               onto: targetID,
+                                               name: "未命名文件夹")
+                        }
                     }
                 }
             }
@@ -1991,6 +2134,7 @@ struct ContentView: View {
         dragGrabOffset = .zero
         dropTarget = nil
         previewPages = nil
+        pagedPreviewSlots = [:]
         dragBasePages = nil
         dragOrigin = nil
         hasLeftOrigin = false
@@ -2050,7 +2194,10 @@ struct ContentView: View {
             }
         }
         .frame(width: gridCellWidth, height: gridCellHeight)
-        .shadow(color: .black.opacity(0.35), radius: 14, y: 6)
+        // 拿起来的图标略放大并轻微倾斜，配合投影拉开与网格的层次。
+        .scaleEffect(1.06)
+        .rotationEffect(.degrees(-1.2))
+        .shadow(color: .black.opacity(0.38), radius: 18, y: 9)
     }
 
     /// 单元格:普通视图 + TapGesture 启动。
@@ -2101,7 +2248,7 @@ struct ContentView: View {
             hoveredEntryID = inside ? app.id : nil
         }
         .animation(AppState.shared.isDragging
-                   ? nil : .spring(response: 0.18, dampingFraction: 0.82),
+                   ? nil : DragMotion.hover,
                    value: cellScale(for: app.id))
         .contextMenu { appContextMenu(app) }
         if handlesTap {

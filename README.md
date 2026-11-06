@@ -13,15 +13,13 @@
 <p align="center">
   <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.6/LaunchPoint-v0.1.6-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
   ·
-  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.6/LaunchPoint-v0.1.6-x86_64.dmg"><strong>Intel 下载</strong></a>
-  ·
   <a href="https://github.com/Wning-ady/LaunchPoint/releases">全部发行版</a>
   ·
   <a href="https://github.com/Wning-ady/LaunchPoint/issues">问题反馈</a>
 </p>
 
 <p align="center">
-  macOS 14+ · Swift 6 · MIT License · 当前版本 v0.1.6
+  macOS 14+ · Swift / SwiftUI · MIT License · 当前版本 v0.1.6
 </p>
 
 ## 简介
@@ -72,9 +70,8 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 | Mac | 安装包 |
 | --- | --- |
 | Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.6/LaunchPoint-v0.1.6-arm64.dmg) |
-| Intel | [下载 x86_64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.6/LaunchPoint-v0.1.6-x86_64.dmg) |
 
-1. 打开与你的 Mac 匹配的 DMG。
+1. 在 Apple Silicon Mac 上打开 arm64 DMG。
 2. 将 `LaunchPoint.app` 拖入 `Applications`。
 3. 首次启动时右键应用并选择“打开”。
 
@@ -88,13 +85,11 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 ./build.sh
 ```
 
-脚本会一次生成两种架构的 App 与 DMG：
+脚本会生成 Apple Silicon（arm64）App 与 DMG：
 
 ```text
 dist/LaunchPoint-arm64.app
-dist/LaunchPoint-x86_64.app
 dist/LaunchPoint-v0.1.6-arm64.dmg
-dist/LaunchPoint-v0.1.6-x86_64.dmg
 ```
 
 严格类型检查：
