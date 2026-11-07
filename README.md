@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.6/LaunchPoint-v0.1.6-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
+  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.7/LaunchPoint-v0.1.7-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
   ·
   <a href="https://github.com/Wning-ady/LaunchPoint/releases">全部发行版</a>
   ·
@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  macOS 14+ · Swift / SwiftUI · MIT License · 当前版本 v0.1.6
+  macOS 14+ · Swift / SwiftUI · MIT License · 当前版本 v0.1.7
 </p>
 
 ## 简介
@@ -69,7 +69,7 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 
 | Mac | 安装包 |
 | --- | --- |
-| Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.6/LaunchPoint-v0.1.6-arm64.dmg) |
+| Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.7/LaunchPoint-v0.1.7-arm64.dmg) |
 
 1. 在 Apple Silicon Mac 上打开 arm64 DMG。
 2. 将 `LaunchPoint.app` 拖入 `Applications`。
@@ -89,7 +89,7 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 
 ```text
 dist/LaunchPoint-arm64.app
-dist/LaunchPoint-v0.1.6-arm64.dmg
+dist/LaunchPoint-v0.1.7-arm64.dmg
 ```
 
 严格类型检查：

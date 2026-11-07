@@ -4,8 +4,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-VERSION="0.1.6"
-BUILD="6"
+VERSION="0.1.7"
+BUILD="7"
 MINIMUM_MACOS="14.0"
 APP_NAME="LaunchPoint"
 DIST_DIR="$PWD/dist"
