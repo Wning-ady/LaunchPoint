@@ -34,15 +34,52 @@ struct UninstallIntegrationFixture {
         }
         let executable = executableDirectory.appendingPathComponent("Fixture")
         try fm.copyItem(at: URL(fileURLWithPath: "/usr/bin/true"), to: executable)
+        let extensionID = "com.waning.OtherExtension.\(suffix)"
+        let extensionContents = contents.appendingPathComponent("PlugIns/Fixture.appex/Contents", isDirectory: true)
+        try fm.createDirectory(at: extensionContents, withIntermediateDirectories: true)
+        guard NSDictionary(dictionary: ["CFBundleIdentifier": extensionID, "CFBundlePackageType": "XPC!"])
+            .write(to: extensionContents.appendingPathComponent("Info.plist"), atomically: true) else {
+            throw FixtureError("Unable to write extension Info.plist")
+        }
 
         let library = fm.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         let applicationSupport = library.appendingPathComponent(
             "Application Support/\(bundleID)", isDirectory: true
         )
         let preference = library.appendingPathComponent("Preferences/\(bundleID).plist")
+        let extensionCache = library.appendingPathComponent("Caches/\(extensionID)", isDirectory: true)
+        defer { try? fm.removeItem(at: extensionCache) }
         try fm.createDirectory(at: applicationSupport, withIntermediateDirectories: true)
         guard NSDictionary(dictionary: ["fixture": true]).write(to: preference, atomically: true) else {
             throw FixtureError("Unable to write fixture preference")
+        }
+
+        let webKitResiduals = ["Caches", "Containers"].flatMap { root in
+            ["GPU", "Networking", "WebContent"].map { helper in
+                library.appendingPathComponent("\(root)/com.apple.WebKit.\(helper)+\(bundleID)", isDirectory: true)
+            }
+        }
+        let unrelatedWebKit = library.appendingPathComponent(
+            "Caches/com.apple.WebKit.GPU+\(bundleID)2", isDirectory: true
+        )
+        defer {
+            for url in webKitResiduals + [unrelatedWebKit] { try? fm.removeItem(at: url) }
+            let trash = fm.homeDirectoryForCurrentUser.appendingPathComponent(".Trash", isDirectory: true)
+            if let trashedItems = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) {
+                for item in trashedItems where (webKitResiduals + [applicationSupport, preference, extensionCache]).contains(where: {
+                    item.lastPathComponent == $0.lastPathComponent
+                        || item.lastPathComponent.hasPrefix($0.lastPathComponent + " ")
+                }) {
+                    try? fm.removeItem(at: item)
+                }
+            }
+        }
+        for url in webKitResiduals + [unrelatedWebKit] {
+            try fm.createDirectory(at: url, withIntermediateDirectories: true)
+        }
+        let discovered = Set(AppActions.residualPaths(appURL: appURL, bundleID: bundleID))
+        guard Set(webKitResiduals).isSubset(of: discovered), !discovered.contains(unrelatedWebKit) else {
+            throw FixtureError("WebKit residual matching missed helpers or selected an unrelated app")
         }
 
         // Recreate one item after the first cleanup pass. This models a
@@ -58,9 +95,11 @@ struct UninstallIntegrationFixture {
         try recreator.run()
 
         var completionResult: String??
+        var savedMetadata: AppActions.UninstallMetadata?
         AppActions.uninstall(
             appURL: appURL,
             bundleID: bundleID,
+            onMetadata: { savedMetadata = $0 },
             beforeFinderFallback: {},
             completion: { completionResult = $0 }
         )
@@ -72,11 +111,14 @@ struct UninstallIntegrationFixture {
         if let error = completionResult! {
             throw FixtureError("Uninstall reported an error: \(error)")
         }
-        let leftovers = [appURL, applicationSupport, preference].filter {
+        let leftovers = ([appURL, applicationSupport, preference] + webKitResiduals).filter {
             fm.fileExists(atPath: $0.path)
         }
         guard leftovers.isEmpty else {
             throw FixtureError("Leftovers remain: \(leftovers.map(\.path).joined(separator: ", "))")
+        }
+        guard fm.fileExists(atPath: unrelatedWebKit.path) else {
+            throw FixtureError("Unrelated WebKit data was removed")
         }
 
         // A stale LaunchPoint entry may point at an app that was already moved
@@ -85,11 +127,14 @@ struct UninstallIntegrationFixture {
         // the app bundle itself is missing.
         try fm.createDirectory(at: applicationSupport, withIntermediateDirectories: true)
         try Data("stale".utf8).write(to: applicationSupport.appendingPathComponent("stale"))
+        try fm.createDirectory(at: extensionCache, withIntermediateDirectories: true)
+        guard let savedMetadata else { throw FixtureError("Missing uninstall metadata snapshot") }
         var staleCompletion: String??
         var finderFallbackCalled = false
         AppActions.uninstall(
             appURL: appURL,
             bundleID: bundleID,
+            snapshot: savedMetadata,
             beforeFinderFallback: { finderFallbackCalled = true },
             completion: { staleCompletion = $0 }
         )
@@ -100,7 +145,8 @@ struct UninstallIntegrationFixture {
             throw FixtureError("Stale cleanup reported an error: \(error)")
         }
         guard !finderFallbackCalled,
-              !fm.fileExists(atPath: applicationSupport.path) else {
+              !fm.fileExists(atPath: applicationSupport.path),
+              !fm.fileExists(atPath: extensionCache.path) else {
             throw FixtureError("Stale cleanup used Finder or left residual data")
         }
         print("PASS bundle=\(bundleID) delayed-recreation-cleaned=true stale-entry-no-finder=true")

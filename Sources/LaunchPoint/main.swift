@@ -41,6 +41,7 @@ final class AppState: ObservableObject {
     var folderTitleEditing = false
     /// 设置面板是否打开(⌘, / 菜单入口)。
     @Published var showSettings = false
+    @Published var showOnboarding = PermissionOnboardingRecord.shouldPresent()
     @Published private(set) var phase: LaunchPointPhase = .hidden
     /// 覆盖层背景设置,由设置页实时修改。
     @Published var backgroundStyle = Settings.backgroundStyle
@@ -64,6 +65,17 @@ final class AppState: ObservableObject {
             showSettings = true
             phase = .settings
         }
+    }
+
+    func showPermissionOnboarding() {
+        showSettings = false
+        showOnboarding = true
+        if phase != .hidden { phase = .visible }
+    }
+
+    func finishPermissionOnboarding() {
+        PermissionOnboardingRecord.complete()
+        showOnboarding = false
     }
 
     func leaveSettings() {
@@ -419,6 +431,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func showSettingsWindow() {
         if window?.isVisible != true { showOverlay() }
+        guard !AppState.shared.showOnboarding else { return }
         AppState.shared.enterSettings()
     }
 
@@ -595,6 +608,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             // 弹窗(重命名对话框等)期间按键全部放行,回车/Esc 由弹窗自己处理
             if self?.window?.attachedSheet != nil {
+                return event
+            }
+            if AppState.shared.showOnboarding {
+                if event.keyCode == 53 {
+                    self?.dismissOverlay()
+                    return nil
+                }
                 return event
             }
             // 设置面板拥有自己的方向键、回车和文本输入。Esc 是唯一由覆盖层
@@ -1021,6 +1041,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func canNavigatePages() -> Bool {
         window?.isVisible == true
             && window?.attachedSheet == nil
+            && AppState.shared.showOnboarding == false
             && AppState.shared.showSettings == false
             && AppState.shared.viewMode == .paged
             && AppState.shared.openFolderID == nil

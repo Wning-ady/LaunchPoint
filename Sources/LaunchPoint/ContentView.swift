@@ -305,6 +305,7 @@ struct ContentView: View {
     @State private var infoTarget: AppItem?
     @State private var uninstallTarget: AppItem?
     @State private var uninstallRetryTarget: AppItem?
+    @State private var uninstallRetryMetadata: AppActions.UninstallMetadata?
     @State private var uninstallResidualCount: Int?
     @State private var uninstallingAppName: String?
     @State private var uninstallError: String?
@@ -505,7 +506,7 @@ struct ContentView: View {
                 .allowsHitTesting(false)
 
             mainContent
-                .allowsHitTesting(!state.showSettings)
+                .allowsHitTesting(!state.showSettings && !state.showOnboarding)
 
             if store.isRefreshing || launchingAppName != nil || uninstallingAppName != nil {
                 activityPill
@@ -535,6 +536,12 @@ struct ContentView: View {
                     .ignoresSafeArea()
                 .zIndex(50)
             }
+
+            if state.showOnboarding {
+                PermissionOnboardingOverlay(finish: { state.finishPermissionOnboarding() })
+                    .ignoresSafeArea()
+                    .zIndex(60)
+            }
         }
         .preferredColorScheme(.dark)
         .onAppear { loadWallpaperIfNeeded() }
@@ -544,6 +551,9 @@ struct ContentView: View {
         }
         .onChange(of: state.gridColumns) { _, _ in clampPreviewPage() }
         .onChange(of: state.gridRows) { _, _ in clampPreviewPage() }
+        .onChange(of: state.showOnboarding) { _, showing in
+            if showing { searchFocused = false } else { focusSearch() }
+        }
         .fileImporter(isPresented: $showProgramImporter,
                       allowedContentTypes: [.application, .unixExecutable],
                       allowsMultipleSelection: true) { result in
@@ -768,6 +778,8 @@ struct ContentView: View {
         AppActions.uninstall(
             appURL: app.url,
             bundleID: app.bundleID,
+            snapshot: uninstallRetryMetadata,
+            onMetadata: { uninstallRetryMetadata = $0 },
             beforeFinderFallback: {
                 dismiss()   // Finder 的管理员认证弹窗不能被全屏层挡住
             },
@@ -788,6 +800,7 @@ struct ContentView: View {
                     (NSApp.delegate as? AppDelegate)?.showOverlay()
                 } else {
                     uninstallRetryTarget = nil
+                    uninstallRetryMetadata = nil
                 }
             }
         )
@@ -795,6 +808,7 @@ struct ContentView: View {
 
     private func prepareUninstall(_ app: AppItem) {
         guard uninstallingAppName == nil else { return }
+        uninstallRetryMetadata = nil
         uninstallTarget = app
         uninstallResidualCount = nil
         let appID = app.id
@@ -1049,7 +1063,7 @@ struct ContentView: View {
 
     private func focusSearch() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            searchFocused = true
+            if !state.showOnboarding { searchFocused = true }
         }
     }
 

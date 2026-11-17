@@ -145,7 +145,7 @@ enum AppActions {
 
     // MARK: - 卸载
 
-    private struct UninstallMetadata {
+    struct UninstallMetadata {
         var bundleIDs = Set<String>()
         var groupContainerIDs = Set<String>()
         var iCloudContainerIDs = Set<String>()
@@ -194,6 +194,15 @@ enum AppActions {
                 "Cookies/\(identifier).binarycookies",
                 "LaunchAgents/\(identifier).plist",
             ].forEach(add)
+
+            // WebKit's per-app helpers use a system prefix followed by the
+            // exact host bundle ID. They do not match the ordinary bundle-ID
+            // prefix scan below; never include helpers for a similarly named app.
+            for root in ["Caches", "Containers"] {
+                for helper in ["GPU", "Networking", "WebContent"] {
+                    add("\(root)/com.apple.WebKit.\(helper)+\(identifier)")
+                }
+            }
 
             // Privileged helpers and system launch services live outside the
             // user's Library. Only exact identifier paths are considered.
@@ -431,11 +440,16 @@ enum AppActions {
     /// 后台执行;`beforeFinderFallback` 在退回 Finder 前于主线程调用(用于收起全屏覆盖层,
     /// 否则 Finder 的认证弹窗会被挡住);`completion` 主线程回调,参数为错误描述(nil = 成功)。
     static func uninstall(appURL: URL, bundleID: String?,
+                          snapshot: UninstallMetadata? = nil,
+                          onMetadata: @escaping (UninstallMetadata) -> Void = { _ in },
                           beforeFinderFallback: @escaping () -> Void,
                           completion: @escaping (String?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             // 必须在移走 app 之前保存扩展和容器信息，否则 Bundle/签名已不可读取。
-            let metadata = uninstallMetadata(appURL: appURL, fallbackBundleID: bundleID)
+            let metadata = snapshot ?? uninstallMetadata(appURL: appURL, fallbackBundleID: bundleID)
+            // Retain the pre-removal identifiers for a retry after the bundle
+            // and its signed entitlements are no longer at their original path.
+            DispatchQueue.main.sync { onMetadata(metadata) }
             let failedToQuit = terminateRunningApplications(
                 appURL: appURL,
                 bundleIDs: metadata.bundleIDs,
@@ -526,25 +540,24 @@ enum AppActions {
                     bundleIDs: metadata.bundleIDs,
                     processNames: metadata.processNames
                 )
-                relaunchedApps.formUnion(stillRunning)
+                // A process may exit during a later pass; only the current
+                // observation should determine the final error.
+                relaunchedApps = Set(stillRunning)
 
                 let currentResiduals = residualPaths(metadata: metadata)
                 if currentResiduals.isEmpty && stillRunning.isEmpty {
                     consecutiveCleanPasses += 1
                 } else {
                     consecutiveCleanPasses = 0
-                    if finderFallbackUsed {
-                        // Do not invoke Finder again after an authorization
-                        // attempt. The remaining paths are reported below.
-                        failedResiduals.formUnion(currentResiduals)
-                    } else {
-                        var residualsForFinder: [URL] = []
-                        for residual in currentResiduals where !directTrash(residual) {
-                            residualsForFinder.append(residual)
-                        }
-                        if !residualsForFinder.isEmpty {
-                            failedResiduals.formUnion(finderTrashOnce(residualsForFinder))
-                        }
+                    // A container can be recreated after Finder returns. Try
+                    // direct cleanup on every pass, even after the one allowed
+                    // Finder attempt, without triggering another prompt.
+                    var residualsForFinder: [URL] = []
+                    for residual in currentResiduals where !directTrash(residual) {
+                        residualsForFinder.append(residual)
+                    }
+                    if !residualsForFinder.isEmpty {
+                        failedResiduals.formUnion(finderTrashOnce(residualsForFinder))
                     }
                 }
 
@@ -581,7 +594,7 @@ enum AppActions {
                         : ""
                     details.append("以下关联文件未能移除：\n\(shown)\(omitted)")
                 }
-                details.append("请检查 Finder 自动化或“完全磁盘访问权限”后重试。")
+                details.append("请检查这些文件是否仍被占用，并确认相关权限后重试。")
                 errorMessage = details.joined(separator: "\n")
             }
             DispatchQueue.main.async { completion(errorMessage) }
@@ -692,7 +705,7 @@ enum AppActions {
     }
 
     /// 让 Finder 一次性把多个文件移到废纸篓(经 osascript 子进程,避免阻塞主线程;
-    /// 同一批次最多触发一次系统授权询问)。返回仍留在原位的路径。
+    /// 将同一批路径作为一条删除命令交给 Finder)。返回仍留在原位的路径。
     private static func finderTrash(_ urls: [URL]) -> Set<URL> {
         let existing = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
         guard !existing.isEmpty else { return [] }
@@ -702,13 +715,7 @@ enum AppActions {
                 .replacingOccurrences(of: "\"", with: "\\\"")
             return "(POSIX file \"\(escaped)\" as alias)"
         }.joined(separator: ", ")
-        let script = "tell application \"Finder\"\n"
-            + "repeat with targetItem in {\(aliases)}\n"
-            + "try\n"
-            + "delete targetItem\n"
-            + "end try\n"
-            + "end repeat\n"
-            + "end tell"
+        let script = "tell application \"Finder\" to delete {\(aliases)}"
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")

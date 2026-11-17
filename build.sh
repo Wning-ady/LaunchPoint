@@ -61,6 +61,9 @@ write_info_plist() {
 <key>LSArchitecturePriority</key><array><string>${arch}</string></array>
 <key>LSMinimumSystemVersion</key><string>${MINIMUM_MACOS}</string>
 <key>LSUIElement</key><true/>
+<key>NSAppleEventsUsageDescription</key><string>需要控制 Finder 将无法直接删除的应用及关联文件移到废纸篓。</string>
+<key>NSAppDataUsageDescription</key><string>需要访问其他应用的容器，以便在您选择卸载时清理相关文件。</string>
+<key>NSAppBundlesUsageDescription</key><string>需要管理其他应用，以便在您选择卸载时将其移到废纸篓。</string>
 </dict></plist>
 PLIST
 }

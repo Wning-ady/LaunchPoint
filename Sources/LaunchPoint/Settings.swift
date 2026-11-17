@@ -491,6 +491,7 @@ struct SettingsPanel: View {
     @State private var spacingCommitGeneration = 0
     @State private var iconPreviewGeneration = 0
     @State private var spacingPreviewGeneration = 0
+    @ObservedObject private var permissionStatus = PermissionGuideStatus.shared
 
     private enum Section: Hashable {
         case general
@@ -1008,6 +1009,7 @@ struct SettingsPanel: View {
 
     private var advancedSettings: some View {
         VStack(alignment: .leading, spacing: 16) {
+            permissionSettings
             dataSettings
             VStack(alignment: .leading, spacing: 8) {
                 settingsSectionLabel("维护", symbol: "wrench.and.screwdriver.fill", tint: AppTheme.settingsMint)
@@ -1021,6 +1023,88 @@ struct SettingsPanel: View {
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
+    }
+
+    private var permissionSettings: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                settingsSectionLabel("权限与卸载", symbol: "lock.shield", tint: AppTheme.settingsBlue)
+                Spacer()
+                Button("刷新状态") { PermissionGuide.refreshPermissionStatuses() }
+            }
+            settingCard {
+                settingRow("完全磁盘访问权限（可选）", detail: "可帮助清理受保护的关联文件，也会授予对邮件、信息等受保护数据的广泛访问权限。请按需在系统设置中启用；若列表中没有 LaunchPoint，可使用“+”添加。") {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        permissionStatusLabel(permissionStatus.fullDiskStatus)
+                        Button("打开设置") { PermissionGuide.openSettings(.fullDiskAccess) }
+                    }
+                }
+                Divider()
+                settingRow("应用程序管理", detail: "允许 LaunchPoint 管理其他应用，可能减少卸载时的权限提示，但不能保证无需输入密码。在系统设置中找到 LaunchPoint 并启用；若尚未出现，请在卸载时按系统提示操作。") {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        permissionStatusLabel(permissionStatus.appManagementStatus)
+                        Button("打开设置") { PermissionGuide.openSettings(.appManagement) }
+                    }
+                }
+                Divider()
+                settingRow("Finder 自动化", detail: "直接移除失败时，允许 LaunchPoint 请 Finder 将文件移到废纸篓。首次使用可先请求授权；曾拒绝时请在系统设置中启用 Finder。") {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        permissionStatusLabel(permissionStatus.finderStatus)
+                        Button("请求授权") {
+                            PermissionGuide.requestFinderAccess { _ in }
+                        }
+                        Button("打开设置") { PermissionGuide.openSettings(.automation) }
+                    }
+                }
+                if let finderStatusDetail = permissionStatus.finderStatusDetail {
+                    Text(finderStatusDetail)
+                        .font(.caption)
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4)
+                }
+                if let finderPermissionMessage = permissionStatus.finderMessage {
+                    Text(finderPermissionMessage)
+                        .font(.caption)
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4)
+                }
+            }
+            settingsInfoCard("部分权限无法直接确认时，请在系统设置中查看。返回后可刷新状态；更改完全磁盘访问权限后若系统提示退出，请重新打开 LaunchPoint。", symbol: "info.circle")
+            HStack {
+                Spacer()
+                Button("再次查看权限引导") { AppState.shared.showPermissionOnboarding() }
+            }
+        }
+        .onAppear { PermissionGuide.refreshPermissionStatuses() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            PermissionGuide.refreshPermissionStatuses()
+        }
+    }
+
+    private func permissionStatusLabel(_ status: PermissionAccessStatus) -> some View {
+        let label: String
+        let color: Color
+        let symbol: String
+        switch status {
+        case .enabled:
+            label = "已开启"
+            color = .green
+            symbol = "checkmark.circle.fill"
+        case .disabled:
+            label = "未开启"
+            color = .orange
+            symbol = "exclamationmark.circle.fill"
+        case .unknown:
+            label = "请在系统设置确认"
+            color = .secondary
+            symbol = "questionmark.circle"
+        }
+        return Label(label, systemImage: symbol)
+            .font(.caption.weight(.medium))
+            .foregroundStyle(color)
+            .accessibilityLabel("权限状态：\(label)")
     }
 
     private var aboutSettings: some View {
@@ -1692,6 +1776,9 @@ struct SettingsPanel: View {
         case "导出布局": return "square.and.arrow.up"
         case "恢复布局": return "square.and.arrow.down"
         case "重新扫描应用": return "arrow.triangle.2.circlepath"
+        case "完全磁盘访问权限（可选）": return "externaldrive"
+        case "应用程序管理": return "app.badge"
+        case "Finder 自动化": return "app.badge"
         case "版本": return "info.circle"
         case "检查更新": return "arrow.down.circle"
         case "发现新版本": return "sparkles"
