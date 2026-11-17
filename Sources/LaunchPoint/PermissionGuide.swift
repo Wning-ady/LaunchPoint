@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 import CoreServices
 
-enum PermissionAccessStatus {
+enum PermissionAccessStatus: String {
     case enabled
     case disabled
     case unknown
@@ -10,11 +10,37 @@ enum PermissionAccessStatus {
 
 final class PermissionGuideStatus: ObservableObject {
     static let shared = PermissionGuideStatus()
+    private let defaults: UserDefaults
     @Published var finderMessage: String?
     @Published var fullDiskStatus: PermissionAccessStatus = .unknown
     @Published var appManagementStatus: PermissionAccessStatus = .unknown
     @Published var finderStatus: PermissionAccessStatus = .unknown
     @Published var finderStatusDetail: String?
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        reloadConfirmations()
+    }
+
+    func reloadConfirmations() {
+        fullDiskStatus = savedConfirmation(.fullDiskAccess)
+        appManagementStatus = savedConfirmation(.appManagement)
+    }
+
+    /// These are the user's records of the System Settings switches, not a
+    /// system permission query. Never turn a failed probe into a denied state.
+    func confirm(_ pane: PermissionGuide.PrivacyPane, status: PermissionAccessStatus) {
+        guard pane != .automation else { return }
+        let key = "PermissionConfirmation.\(pane.rawValue)"
+        if status == .unknown { defaults.removeObject(forKey: key) }
+        else { defaults.set(status.rawValue, forKey: key) }
+        reloadConfirmations()
+    }
+
+    private func savedConfirmation(_ pane: PermissionGuide.PrivacyPane) -> PermissionAccessStatus {
+        guard let rawValue = defaults.string(forKey: "PermissionConfirmation.\(pane.rawValue)") else { return .unknown }
+        return PermissionAccessStatus(rawValue: rawValue) ?? .unknown
+    }
 }
 
 /// System privacy controls live outside LaunchPoint. Hide its floating overlay
@@ -38,6 +64,7 @@ enum PermissionGuide {
     }
 
     static func refreshPermissionStatuses() {
+        PermissionGuideStatus.shared.reloadConfirmations()
         refreshFinderStatus()
     }
 
@@ -66,7 +93,7 @@ enum PermissionGuide {
         }
     }
 
-    enum PrivacyPane {
+    enum PrivacyPane: String {
         case fullDiskAccess
         case appManagement
         case automation
@@ -88,23 +115,46 @@ enum PermissionGuide {
             case .automation: return "自动化"
             }
         }
+
+        var compatibilityURL: URL {
+            URL(string: url.absoluteString.replacingOccurrences(
+                of: "com.apple.settings.PrivacySecurity.extension",
+                with: "com.apple.preference.security"
+            ))!
+        }
     }
 
-    static func openSettings(_ pane: PrivacyPane) {
+    static func openSettings(_ pane: PrivacyPane, compatibility: Bool = false) {
         (NSApp.delegate as? AppDelegate)?.dismissOverlay()
-        // Wait for the overlay's closing animation and deactivation to finish.
+        // Route only after System Settings has launched. Delivering a deep link
+        // during a cold launch can leave the app on its restored/default page.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            guard !NSWorkspace.shared.open(pane.url) else { return }
-            (NSApp.delegate as? AppDelegate)?.showOverlay()
-            let alert = NSAlert()
-            alert.messageText = "无法打开系统设置"
-            alert.informativeText = "请手动打开系统设置 → 隐私与安全性 → \(pane.name)。如果 LaunchPoint 暂未出现在列表中，请在需要时操作或按系统提示授权。"
-            alert.addButton(withTitle: "好")
-            if let window = NSApp.keyWindow {
-                alert.beginSheetModal(for: window)
-            } else {
-                alert.runModal()
+            guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.systempreferences") else {
+                showSettingsError(pane)
+                return
             }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { _, error in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    guard error == nil else { showSettingsError(pane); return }
+                    let destination = compatibility ? pane.compatibilityURL : pane.url
+                    guard NSWorkspace.shared.open(destination) else { showSettingsError(pane); return }
+                }
+            }
+        }
+    }
+
+    private static func showSettingsError(_ pane: PrivacyPane) {
+        (NSApp.delegate as? AppDelegate)?.showOverlay()
+        let alert = NSAlert()
+        alert.messageText = "无法打开系统设置"
+        alert.informativeText = "请手动打开系统设置 → 隐私与安全性 → \(pane.name)。如果 LaunchPoint 暂未出现在列表中，请在需要时操作或按系统提示授权。"
+        alert.addButton(withTitle: "好")
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
         }
     }
 
