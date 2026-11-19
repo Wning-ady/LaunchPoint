@@ -22,6 +22,12 @@ struct UninstallPolicyFixture {
         try require(!AppActions.isUninstallableApp(
                         at: URL(fileURLWithPath: "/System/Applications/Mail.app")),
                     "System app was marked uninstallable")
+        try require(AppActions.removalFailureAdvice("Finder error (-128)").contains("已取消"),
+                    "Cancellation was mislabeled as permission denial")
+        try require(AppActions.removalFailureAdvice("Finder error (-1743)").contains("自动化"),
+                    "Automation denial did not explain the required permission")
+        try require(AppActions.removalFailureAdvice("Finder error (-5000)").contains("管理员密码"),
+                    "Filesystem denial did not distinguish privacy authorization")
         print("PASS ordinary-app-no-finder-first=true protected-system-finder-first=true standalone-protected=true")
     }
 

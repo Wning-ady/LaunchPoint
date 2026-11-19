@@ -491,7 +491,6 @@ struct SettingsPanel: View {
     @State private var spacingCommitGeneration = 0
     @State private var iconPreviewGeneration = 0
     @State private var spacingPreviewGeneration = 0
-    @ObservedObject private var permissionStatus = PermissionGuideStatus.shared
 
     private enum Section: Hashable {
         case general
@@ -1030,96 +1029,25 @@ struct SettingsPanel: View {
             HStack {
                 settingsSectionLabel("权限与卸载", symbol: "lock.shield", tint: AppTheme.settingsBlue)
                 Spacer()
-                Button("刷新状态") { PermissionGuide.refreshPermissionStatuses() }
+                Button { PermissionGuide.refreshPermissionStatuses() } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("刷新权限状态")
+                .accessibilityLabel("刷新权限状态")
             }
             settingCard {
-                settingRow("完全磁盘访问权限（可选）", detail: "可帮助清理受保护的关联文件，也会授予对邮件、信息等受保护数据的广泛访问权限。请按需在系统设置中启用；若列表中没有 LaunchPoint，可使用“+”添加。") {
-                    VStack(alignment: .trailing, spacing: 6) {
-                        permissionStatusLabel(permissionStatus.fullDiskStatus, manual: true)
-                        permissionConfirmationMenu(.fullDiskAccess)
-                        Button("打开设置") { PermissionGuide.openSettings(.fullDiskAccess) }
-                        Button("兼容入口") { PermissionGuide.openSettings(.fullDiskAccess, compatibility: true) }
-                            .font(.caption)
-                    }
-                }
+                PermissionAccessRow(pane: .fullDiskAccess)
                 Divider()
-                settingRow("应用程序管理", detail: "允许 LaunchPoint 管理其他应用，可能减少卸载时的权限提示，但不能保证无需输入密码。在系统设置中找到 LaunchPoint 并启用；若尚未出现，请在卸载时按系统提示操作。") {
-                    VStack(alignment: .trailing, spacing: 6) {
-                        permissionStatusLabel(permissionStatus.appManagementStatus, manual: true)
-                        permissionConfirmationMenu(.appManagement)
-                        Button("打开设置") { PermissionGuide.openSettings(.appManagement) }
-                        Button("兼容入口") { PermissionGuide.openSettings(.appManagement, compatibility: true) }
-                            .font(.caption)
-                    }
-                }
+                PermissionAccessRow(pane: .appManagement)
                 Divider()
-                settingRow("Finder 自动化", detail: "直接移除失败时，允许 LaunchPoint 请 Finder 将文件移到废纸篓。首次使用可先请求授权；曾拒绝时请在系统设置中启用 Finder。") {
-                    VStack(alignment: .trailing, spacing: 6) {
-                        permissionStatusLabel(permissionStatus.finderStatus)
-                        Button("请求授权") {
-                            PermissionGuide.requestFinderAccess { _ in }
-                        }
-                        Button("打开设置") { PermissionGuide.openSettings(.automation) }
-                    }
-                }
-                if let finderStatusDetail = permissionStatus.finderStatusDetail {
-                    Text(finderStatusDetail)
-                        .font(.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 4)
-                }
-                if let finderPermissionMessage = permissionStatus.finderMessage {
-                    Text(finderPermissionMessage)
-                        .font(.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 4)
-                }
+                PermissionAccessRow(pane: .automation)
             }
-            settingsInfoCard("前两项由你在系统设置中查看后，点击“确认状态”记录为已开启或未开启，并标注为手动确认；系统开关变化后请重新确认。Finder 自动化由系统检测。若跳转未到对应页面，可试用兼容入口，或前往“系统设置 → 隐私与安全性”。", symbol: "info.circle")
             HStack {
                 Spacer()
-                Button("再次查看权限引导") { AppState.shared.showPermissionOnboarding() }
+                Button("权限引导") { AppState.shared.showPermissionOnboarding() }
             }
         }
-        .onAppear { PermissionGuide.refreshPermissionStatuses() }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            PermissionGuide.refreshPermissionStatuses()
-        }
-    }
-
-    private func permissionConfirmationMenu(_ pane: PermissionGuide.PrivacyPane) -> some View {
-        Menu("确认状态") {
-            Button("我已开启") { permissionStatus.confirm(pane, status: .enabled) }
-            Button("我未开启") { permissionStatus.confirm(pane, status: .disabled) }
-            Button("清除确认记录") { permissionStatus.confirm(pane, status: .unknown) }
-        }
-        .fixedSize()
-    }
-
-    private func permissionStatusLabel(_ status: PermissionAccessStatus, manual: Bool = false) -> some View {
-        let label: String
-        let color: Color
-        let symbol: String
-        switch status {
-        case .enabled:
-            label = manual ? "已开启（手动确认）" : "已开启"
-            color = .green
-            symbol = "checkmark.circle.fill"
-        case .disabled:
-            label = manual ? "未开启（手动确认）" : "未开启"
-            color = .orange
-            symbol = "exclamationmark.circle.fill"
-        case .unknown:
-            label = "请在系统设置确认"
-            color = .secondary
-            symbol = "questionmark.circle"
-        }
-        return Label(label, systemImage: symbol)
-            .font(.caption.weight(.medium))
-            .foregroundStyle(color)
-            .accessibilityLabel("权限状态：\(label)")
+        .livePermissionUpdates()
     }
 
     private var aboutSettings: some View {

@@ -1,6 +1,9 @@
 import AppKit
 import Foundation
 import CoreServices
+import Darwin
+import Security
+import SQLite3
 
 enum PermissionAccessStatus: String {
     case enabled
@@ -10,37 +13,18 @@ enum PermissionAccessStatus: String {
 
 final class PermissionGuideStatus: ObservableObject {
     static let shared = PermissionGuideStatus()
-    private let defaults: UserDefaults
+    @Published var hasChecked = false
+    @Published var isRefreshing = false
     @Published var finderMessage: String?
     @Published var fullDiskStatus: PermissionAccessStatus = .unknown
     @Published var appManagementStatus: PermissionAccessStatus = .unknown
+    @Published var appManagementUsesProbe = false
+    @Published var appManagementDetail: String?
     @Published var finderStatus: PermissionAccessStatus = .unknown
     @Published var finderStatusDetail: String?
 
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
-        reloadConfirmations()
-    }
-
-    func reloadConfirmations() {
-        fullDiskStatus = savedConfirmation(.fullDiskAccess)
-        appManagementStatus = savedConfirmation(.appManagement)
-    }
-
-    /// These are the user's records of the System Settings switches, not a
-    /// system permission query. Never turn a failed probe into a denied state.
-    func confirm(_ pane: PermissionGuide.PrivacyPane, status: PermissionAccessStatus) {
-        guard pane != .automation else { return }
-        let key = "PermissionConfirmation.\(pane.rawValue)"
-        if status == .unknown { defaults.removeObject(forKey: key) }
-        else { defaults.set(status.rawValue, forKey: key) }
-        reloadConfirmations()
-    }
-
-    private func savedConfirmation(_ pane: PermissionGuide.PrivacyPane) -> PermissionAccessStatus {
-        guard let rawValue = defaults.string(forKey: "PermissionConfirmation.\(pane.rawValue)") else { return .unknown }
-        return PermissionAccessStatus(rawValue: rawValue) ?? .unknown
-    }
+    /// Saved user confirmations never establish an effective permission.
+    init(defaults: UserDefaults = .standard) {}
 }
 
 /// System privacy controls live outside LaunchPoint. Hide its floating overlay
@@ -64,8 +48,166 @@ enum PermissionGuide {
     }
 
     static func refreshPermissionStatuses() {
-        PermissionGuideStatus.shared.reloadConfirmations()
-        refreshFinderStatus()
+        // Polling and app activation can coincide; never queue overlapping probes
+        // or leave the UI showing values from different refresh generations.
+        let state = PermissionGuideStatus.shared
+        guard !state.isRefreshing else { return }
+        state.isRefreshing = true
+        finderScriptQueue.async {
+            let disk = fullDiskStatus()
+            let management = appManagementStatus()
+            let probe = management == .unknown ? probeAppManagement() : nil
+            let finder = finderStatus(for: determineFinderPermission(askUserIfNeeded: false))
+            DispatchQueue.main.async {
+                state.fullDiskStatus = disk
+                state.appManagementStatus = probe?.0 ?? management
+                state.appManagementUsesProbe = probe != nil
+                state.appManagementDetail = probe?.1
+                state.finderStatus = finder.0
+                state.finderStatusDetail = finder.1
+                state.finderMessage = nil
+                state.hasChecked = true
+                state.isRefreshing = false
+            }
+        }
+    }
+
+    /// Probe a system TCC-protected file without reading its contents. A missing
+    /// file or a Unix permission error cannot establish the privacy switch.
+    static func fullDiskStatus() -> PermissionAccessStatus {
+        let descriptor = open("/Library/Application Support/com.apple.TCC/TCC.db", O_RDONLY | O_CLOEXEC)
+        if descriptor >= 0 {
+            close(descriptor)
+            return .enabled
+        }
+        return fullDiskStatus(openError: errno)
+    }
+
+    static func fullDiskStatus(openError: Int32) -> PermissionAccessStatus {
+        openError == EPERM ? .disabled : .unknown
+    }
+
+    /// Best-effort read of this app's TCC record, never a private TCC API or a
+    /// database write. Schema/access changes fall back to unknown. A matching
+    /// bundle ID alone is insufficient after an app has been replaced/re-signed.
+    static func appManagementStatus() -> PermissionAccessStatus {
+        guard let bundleID = Bundle.main.bundleIdentifier,
+              let executable = Bundle.main.executableURL else { return .unknown }
+        let databases = [
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/com.apple.TCC/TCC.db"),
+            URL(fileURLWithPath: "/Library/Application Support/com.apple.TCC/TCC.db")
+        ]
+        let identities: [(String, Int32)] = [(bundleID, 0), (Bundle.main.bundleURL.path, 1), (executable.path, 1)]
+        let statuses = databases.flatMap { database in
+            identities.compactMap { client, type in
+                appManagementRecord(databaseURL: database, client: client, clientType: type,
+                                    codeURL: Bundle.main.bundleURL)
+            }
+        }
+        guard let first = statuses.first, statuses.allSatisfy({ $0 == first }) else { return .unknown }
+        return first
+    }
+
+    static func appManagementRecord(databaseURL: URL, client: String, clientType: Int32,
+                                    codeURL: URL) -> PermissionAccessStatus? {
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            if let database { sqlite3_close(database) }
+            return nil
+        }
+        defer { sqlite3_close(database) }
+        sqlite3_busy_timeout(database, 100)
+        var statement: OpaquePointer?
+        let query = "SELECT auth_value, csreq FROM access WHERE service = 'kTCCServiceSystemPolicyAppBundles' AND client = ? AND client_type = ?"
+        guard sqlite3_prepare_v2(database, query, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        guard sqlite3_bind_text(statement, 1, client, -1, transient) == SQLITE_OK,
+              sqlite3_bind_int(statement, 2, clientType) == SQLITE_OK else { return nil }
+        var statuses: [PermissionAccessStatus] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { break }
+            guard result == SQLITE_ROW else { return nil }
+            guard sqlite3_column_type(statement, 0) == SQLITE_INTEGER,
+                  let bytes = sqlite3_column_blob(statement, 1) else { return .unknown }
+            let count = Int(sqlite3_column_bytes(statement, 1))
+            guard count > 0 else { return .unknown }
+            let data = Data(bytes: bytes, count: count)
+            var requirement: SecRequirement?
+            var code: SecStaticCode?
+            guard SecRequirementCreateWithData(data as CFData, [], &requirement) == errSecSuccess,
+                  let requirement,
+                  SecStaticCodeCreateWithPath(codeURL as CFURL, [], &code) == errSecSuccess,
+                  let code,
+                  SecStaticCodeCheckValidity(code, [], requirement) == errSecSuccess else { return .unknown }
+            switch sqlite3_column_int(statement, 0) {
+            case 0: statuses.append(.disabled)
+            case 2: statuses.append(.enabled)
+            default: return .unknown
+            }
+        }
+        guard let first = statuses.first else { return nil }
+        return statuses.allSatisfy { $0 == first } ? first : .unknown
+    }
+
+    /// macOS 27 protects the per-user TCC database even when Full Disk Access
+    /// is granted. Report an observed capability instead of inventing a switch
+    /// value. Opening O_WRONLY without O_TRUNC/O_CREAT does not change the file;
+    /// macOS may request App Management consent when it checks this operation.
+    static func probeAppManagement() -> (PermissionAccessStatus, String?) {
+        let ownURL = Bundle.main.bundleURL.standardizedFileURL
+        let roots = [URL(fileURLWithPath: "/Applications", isDirectory: true),
+                     FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications")]
+        var deniedApp: String?
+        var attempts = 0
+        for root in roots {
+            let apps = (try? FileManager.default.contentsOfDirectory(at: root,
+                includingPropertiesForKeys: [.isSymbolicLinkKey], options: [.skipsHiddenFiles])) ?? []
+            for app in apps.sorted(by: { $0.path < $1.path }) {
+                guard app.pathExtension == "app", app.standardizedFileURL != ownURL,
+                      (try? app.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == false,
+                      let bundle = Bundle(url: app), let identifier = bundle.bundleIdentifier,
+                      !identifier.hasPrefix("com.apple."), identifier != Bundle.main.bundleIdentifier else { continue }
+                let file = app.appendingPathComponent("Contents/Info.plist")
+                // Skip Unix ownership/ACL and system volume limitations rather
+                // than misreporting those as a privacy denial.
+                guard isOwnedWritableRegularFile(file) else { continue }
+                attempts += 1
+                let status = probeWriteAccess(at: file)
+                if status == .enabled {
+                    return (.enabled, "已验证“\(app.deletingPathExtension().lastPathComponent)”的文件写入访问，未修改任何内容。这是实际访问结果，不是系统开关查询；其他应用或残留文件仍可能有额外限制。")
+                }
+                if status == .disabled { deniedApp = app.deletingPathExtension().lastPathComponent }
+                if attempts >= 8 { break }
+            }
+            if attempts >= 8 { break }
+        }
+        if let deniedApp {
+            return (.disabled, "系统阻止了对“\(deniedApp)”的写入访问。请在系统设置确认 App 管理授权；文件自身的保护也可能造成拒绝。")
+        }
+        return (.unknown, "无法读取系统授权记录，也未找到可验证的应用文件。请到系统设置查看 App 管理开关。")
+    }
+
+    private static func isOwnedWritableRegularFile(_ url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return false }
+        return (info.st_mode & S_IFMT) == S_IFREG && info.st_uid == geteuid()
+            && (info.st_mode & S_IWUSR) != 0
+    }
+
+    static func probeWriteAccess(at url: URL) -> PermissionAccessStatus {
+        guard isOwnedWritableRegularFile(url) else { return .unknown }
+        // Reject symlinks even if a path is replaced between lstat and open.
+        let descriptor = open(url.path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        guard descriptor >= 0 else { return writeAccessStatus(openError: errno) }
+        close(descriptor)
+        return .enabled
+    }
+
+    static func writeAccessStatus(openError: Int32) -> PermissionAccessStatus {
+        openError == EPERM ? .disabled : .unknown
     }
 
     /// The API requires a running target and must run on the serial queue.

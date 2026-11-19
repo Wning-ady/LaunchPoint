@@ -463,11 +463,10 @@ enum AppActions {
                 return
             }
 
-            // A protected app/container can make Finder show an authorization
-            // dialog. Keep the fallback as one batch for this uninstall run;
-            // retrying it once per residual and once per pass causes repeated
-            // password prompts for the same operation.
+            // Allow one Finder attempt per uninstall to avoid repeated password
+            // prompts. Handle the bundle separately from protected residuals.
             var finderFallbackUsed = false
+            var removalErrors: [URL: String] = [:]
             func directTrash(_ url: URL) -> Bool {
                 unloadLaunchServiceIfNeeded(at: url)
                 do {
@@ -480,6 +479,8 @@ enum AppActions {
                     }
                     return removed
                 } catch {
+                    let failure = error as NSError
+                    removalErrors[url] = "\(failure.localizedDescription)（\(failure.domain) \(failure.code)）"
                     return false
                 }
             }
@@ -492,7 +493,11 @@ enum AppActions {
                 let existing = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
                 guard !existing.isEmpty else { return [] }
                 DispatchQueue.main.sync { beforeFinderFallback() }
-                let remaining = finderTrash(existing)
+                let result = finderTrash(existing)
+                let remaining = result.remaining
+                if let error = result.error {
+                    for url in remaining { removalErrors[url] = error }
+                }
                 for url in existing where !remaining.contains(url)
                     && url.pathExtension.caseInsensitiveCompare("app") == .orderedSame {
                     unregisterApplication(at: url)
@@ -500,28 +505,27 @@ enum AppActions {
                 return remaining
             }
 
-            let initialResiduals = residualPaths(metadata: metadata)
             if shouldUseFinderFirst(for: appURL.path) {
-                // Include the initial residual snapshot in the same Finder
-                // operation so a protected app and its container share one
-                // authorization prompt.
-                _ = finderTrashOnce([appURL] + initialResiduals)
+                // Never batch protected containers with the bundle: one denied
+                // container can abort Finder's entire delete command.
+                _ = finderTrashOnce([appURL])
             } else if FileManager.default.fileExists(atPath: appURL.path) {
                 // User-installed apps normally succeed here without Finder or
                 // an administrator prompt. Fall back only for this actual
                 // failure, rather than based on the parent directory alone.
                 if !directTrash(appURL) {
-                    _ = finderTrashOnce([appURL] + initialResiduals)
+                    _ = finderTrashOnce([appURL])
                 }
             }
 
             let appWasRemoved = !FileManager.default.fileExists(atPath: appURL.path)
             guard appWasRemoved else {
+                let detail = removalErrors[appURL] ?? "文件仍在原位置，系统未返回错误详情。"
                 let errorMessage = """
-                无法移除“\(appURL.deletingPathExtension().lastPathComponent)”:权限不足,\
-                且 Finder 代删被拒或被取消。
-                可在 Finder 中手动将其移到废纸篓;若从未弹出过授权窗口,\
-                请在 系统设置 → 隐私与安全性 → 自动化 中允许本应用控制 Finder 后重试。
+                无法移除“\(appURL.deletingPathExtension().lastPathComponent)”。
+                路径：\(appURL.path)
+                系统错误：\(detail)
+                \(removalFailureAdvice(detail))
                 """
                 DispatchQueue.main.async { completion(errorMessage) }
                 return
@@ -588,7 +592,10 @@ enum AppActions {
                     let sortedResiduals = failedResiduals.sorted {
                         $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending
                     }
-                    let shown = sortedResiduals.prefix(5).map(\.path).joined(separator: "\n")
+                    let shown = sortedResiduals.prefix(5).map { url in
+                        let detail = removalErrors[url].map { "：\($0)" } ?? ""
+                        return url.path + detail
+                    }.joined(separator: "\n")
                     let omitted = failedResiduals.count > 5
                         ? "\n另有 \(failedResiduals.count - 5) 项"
                         : ""
@@ -704,31 +711,42 @@ enum AppActions {
         }
     }
 
-    /// 让 Finder 一次性把多个文件移到废纸篓(经 osascript 子进程,避免阻塞主线程;
-    /// 将同一批路径作为一条删除命令交给 Finder)。返回仍留在原位的路径。
-    private static func finderTrash(_ urls: [URL]) -> Set<URL> {
+    static func removalFailureAdvice(_ detail: String) -> String {
+        if detail.contains("-128") {
+            return "已取消系统授权，未继续尝试删除。"
+        }
+        if detail.contains("-1743") {
+            return "请在系统设置 → 隐私与安全性 → 自动化中允许 LaunchPoint 控制 Finder。"
+        }
+        return "管理员密码不能代替系统隐私授权。请检查应用程序管理权限、文件是否锁定或磁盘是否只读；修改授权后退出并重新打开 LaunchPoint。也可在 Finder 中尝试移到废纸篓，查看系统的具体提示。"
+    }
+
+    /// Preserve Finder's actual error instead of describing every failure as
+    /// denied automation. Drain stderr before waiting to avoid a full-pipe stall.
+    private static func finderTrash(_ urls: [URL]) -> (remaining: Set<URL>, error: String?) {
         let existing = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
-        guard !existing.isEmpty else { return [] }
+        guard !existing.isEmpty else { return ([], nil) }
         let aliases = existing.map { url in
             let escaped = url.path
                 .replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"")
             return "(POSIX file \"\(escaped)\" as alias)"
         }.joined(separator: ", ")
-        let script = "tell application \"Finder\" to delete {\(aliases)}"
-
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        task.arguments = ["-e", script]
-        task.standardOutput = Pipe()
-        task.standardError = Pipe()
+        task.arguments = ["-e", "tell application \"Finder\" to delete {\(aliases)}"]
+        task.standardOutput = FileHandle.nullDevice
+        let errors = Pipe()
+        task.standardError = errors
         do {
             try task.run()
         } catch {
-            return Set(existing)
+            return (Set(existing), error.localizedDescription)
         }
+        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
-        // Finder 返回后确认哪些路径仍在原位。
-        return Set(existing.filter { FileManager.default.fileExists(atPath: $0.path) })
+        let remaining = Set(existing.filter { FileManager.default.fileExists(atPath: $0.path) })
+        let detail = String(decoding: errorData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (remaining, detail.isEmpty ? nil : detail)
     }
 }

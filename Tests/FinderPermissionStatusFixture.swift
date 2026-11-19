@@ -21,16 +21,14 @@ struct FinderPermissionStatusFixture {
         let suite = "LaunchPoint.PermissionConfirmationFixture.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
-        let first = PermissionGuideStatus(defaults: defaults)
-        precondition(first.fullDiskStatus == .unknown && first.appManagementStatus == .unknown)
-        first.confirm(.fullDiskAccess, status: .enabled)
-        first.confirm(.appManagement, status: .disabled)
-        let reopened = PermissionGuideStatus(defaults: defaults)
-        precondition(reopened.fullDiskStatus == .enabled && reopened.appManagementStatus == .disabled)
-        reopened.confirm(.fullDiskAccess, status: .unknown)
-        precondition(PermissionGuideStatus(defaults: defaults).fullDiskStatus == .unknown)
-        reopened.confirm(.automation, status: .enabled)
-        precondition(reopened.finderStatus == .unknown, "Manual records must not override system Finder status")
+        defaults.set("enabled", forKey: "PermissionConfirmation.fullDiskAccess")
+        defaults.set("enabled", forKey: "PermissionConfirmation.appManagement")
+        let status = PermissionGuideStatus(defaults: defaults)
+        precondition(status.fullDiskStatus == .unknown && status.appManagementStatus == .unknown,
+                     "Old manual confirmations must not appear as detected permissions")
+        precondition(PermissionGuide.fullDiskStatus(openError: EPERM) == .disabled)
+        precondition(PermissionGuide.fullDiskStatus(openError: ENOENT) == .unknown)
+        precondition(PermissionGuide.fullDiskStatus(openError: EACCES) == .unknown)
         print("Finder permission status checks passed")
     }
 }

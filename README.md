@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.9/LaunchPoint-v0.1.9-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
+  <a href="https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.11/LaunchPoint-v0.1.11-arm64.dmg"><strong>Apple Silicon 下载</strong></a>
   ·
   <a href="https://github.com/Wning-ady/LaunchPoint/releases">全部发行版</a>
   ·
@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  macOS 14+ · Swift / SwiftUI · MIT License · 当前版本 v0.1.9
+  macOS 14+ · Swift / SwiftUI · MIT License · 当前版本 v0.1.11
 </p>
 
 ## 简介
@@ -62,6 +62,7 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 - 支持四指或五指触控板手势：聚拢显示，扩散隐藏。
 - 主显示器、活跃显示器和鼠标所在显示器策略。
 - 登录时启动与菜单栏入口。
+- 权限引导与设置实时显示授权或访问检测结果，三项权限集中展示。
 - 应用内检查并安装 GitHub Releases 更新，自动匹配当前处理器架构。
 - 应用移入废纸篓后自动停止后台进程，并可退出同时关闭开机启动。
 
@@ -69,7 +70,7 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 
 | Mac | 安装包 |
 | --- | --- |
-| Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.9/LaunchPoint-v0.1.9-arm64.dmg) |
+| Apple Silicon | [下载 arm64 DMG](https://github.com/Wning-ady/LaunchPoint/releases/download/v0.1.11/LaunchPoint-v0.1.11-arm64.dmg) |
 
 1. 在 Apple Silicon Mac 上打开 arm64 DMG。
 2. 将 `LaunchPoint.app` 拖入 `Applications`。
@@ -89,7 +90,7 @@ LaunchPoint 专注于应用启动这一件事：以原生、清晰、可调整�
 
 ```text
 dist/LaunchPoint-arm64.app
-dist/LaunchPoint-v0.1.9-arm64.dmg
+dist/LaunchPoint-v0.1.11-arm64.dmg
 ```
 
 严格类型检查：
